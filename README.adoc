@@ -1,7 +1,9 @@
 image:https://github.com/p2poolv2/p2poolv2/actions/workflows/rust.yml/badge.svg[Rust CI, link=https://github.com/p2poolv2/p2poolv2/actions/workflows/rust.yml]
 image:https://codecov.io/gh/p2poolv2/p2poolv2/graph/badge.svg?token=Xeu4GFdASS[Codecov, link=https://codecov.io/gh/p2poolv2/p2poolv2]
 
-== P2Poolv2
+== P2Poolv2 (Shizik + psix751 version) 
+
+*это все Кэ Цин! она начала первая*
 
 ****
 **Mission:** ##Replace pool operators with miners##
