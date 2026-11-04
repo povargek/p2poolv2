@@ -1,21 +1,10 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::accounting::OutputPair;
-use crate::shares::witness_commitment::WitnessCommitment;
+use crate::shares::transactions::coinbase::BIP141_COMMITMENT_HEADER;
+use crate::shares::witness_commitment::{WITNESS_COMMITMENT_LENGTH, WitnessCommitment};
 use crate::stratum::session::{EXTRANONCE1_SIZE, EXTRANONCE2_SIZE};
 use crate::stratum::work::error::WorkError;
 use crate::utils::time_provider::TimeProvider;
@@ -24,6 +13,7 @@ use bitcoin::blockdata::script::Builder;
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::{self, Hash, sha256d};
 use bitcoin::network::Network;
+use bitcoin::opcodes::all::{OP_PUSHBYTES_32, OP_RETURN};
 use bitcoin::script::{Instruction, PushBytesBuf};
 use bitcoin::transaction::{Sequence, Transaction, TxIn, TxOut, Version};
 use bitcoin::{Address, Amount};
@@ -37,10 +27,26 @@ pub(crate) const EXTRANONCE_SEPARATOR: [u8; EXTRANONCE1_SIZE + EXTRANONCE2_SIZE]
 const SEQUENCE_LENGTH: usize = 4;
 
 /// Length of the lock time bytes in coinbase
-const LOCKTIME_LENGTH: usize = 4;
+pub(crate) const LOCKTIME_LENGTH: usize = 4;
 
 /// Sequence for coinbase
 const BIP54_COINBASE_SEQUENCE: Sequence = Sequence(0xffff_fffe);
+
+/// Script of the commitment output: OP_RETURN, OP_PUSHBYTES_32, then the
+/// 32-byte share commitment hash.
+const COMMITMENT_SCRIPT_LENGTH: usize = 2 + 32;
+
+/// Serialized bytes that follow the coinbase prefix: the commitment output
+/// (8-byte value, 1-byte script length, script) and the locktime.
+///
+/// Everything before these bytes is the prefix a SHA256 midstate summarises,
+/// so a verifier holding the midstate, the commitment hash and the locktime
+/// can recompute the coinbase txid without the payout outputs.
+pub(crate) const COMMITMENT_TAIL_LENGTH: usize = 8 + 1 + COMMITMENT_SCRIPT_LENGTH + LOCKTIME_LENGTH;
+
+/// SHA256 block size. The coinbase prefix is padded to a multiple of it, so a
+/// midstate covers the whole prefix and no prefix bytes trail into the tail.
+pub(crate) const SHA256_BLOCK_SIZE: usize = 64;
 
 /// Parse Address from a string provided by the miner.
 ///
@@ -86,6 +92,75 @@ fn append_default_witness_commitment(
     }
 }
 
+/// The output carrying the share commitment hash: `OP_RETURN OP_PUSHBYTES_32 <hash>`.
+///
+/// It is the coinbase's last output, so only the locktime follows it. Its
+/// script does not match the BIP141 witness commitment pattern
+/// (`6a24aa21a9ed`), so the witness commitment output before it is still the
+/// one BIP141 selects.
+pub(crate) fn commitment_output(commitment_hash: &sha256::Hash) -> TxOut {
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(commitment_hash.as_byte_array())
+            .into_script(),
+    }
+}
+
+/// A zero-value `OP_RETURN` output pushing `padding_length` zero bytes.
+///
+/// `padding_length` is below `SHA256_BLOCK_SIZE`, so the push is a single
+/// `OP_PUSHBYTES_n` opcode and the output grows by exactly one byte per byte
+/// of padding.
+fn padding_output(padding_length: usize) -> TxOut {
+    let padding = PushBytesBuf::try_from(vec![0u8; padding_length])
+        .expect("padding is shorter than SHA256_BLOCK_SIZE, far under the push limit");
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(padding)
+            .into_script(),
+    }
+}
+
+/// Bytes of padding that bring `unpadded_prefix_length` up to the next
+/// multiple of `SHA256_BLOCK_SIZE`; zero when it is already a multiple.
+fn padding_to_block_boundary(unpadded_prefix_length: usize) -> usize {
+    (SHA256_BLOCK_SIZE - unpadded_prefix_length % SHA256_BLOCK_SIZE) % SHA256_BLOCK_SIZE
+}
+
+/// Append the padding and commitment outputs, padding so the serialized
+/// coinbase prefix -- everything before the commitment output -- is a whole
+/// number of SHA256 blocks.
+///
+/// The padding length depends on everything before it (payouts, scriptSig,
+/// witness commitment) and is determined by it: the validator rebuilds the
+/// coinbase with this function and gets the same padding, and a proof
+/// verifier never sees it, as it lies inside the midstate.
+///
+/// The coinbase is sized once, with an empty padding output already in
+/// place. Padding it by n bytes then grows the coinbase by exactly n: the
+/// push stays one `OP_PUSHBYTES_n` opcode, the script length stays a one-byte
+/// CompactSize, and the output count does not change.
+fn append_commitment_outputs(coinbase: &mut Transaction, commitment_hash: &sha256::Hash) {
+    coinbase.output.push(padding_output(0));
+    coinbase.output.push(commitment_output(commitment_hash));
+
+    let unpadded_prefix_length = coinbase.base_size() - COMMITMENT_TAIL_LENGTH;
+    let padding_length = padding_to_block_boundary(unpadded_prefix_length);
+    let [padding, _commitment] = coinbase
+        .output
+        .last_chunk_mut()
+        .expect("the padding and commitment outputs were just appended");
+    *padding = padding_output(padding_length);
+
+    debug_assert!(
+        (coinbase.base_size() - COMMITMENT_TAIL_LENGTH).is_multiple_of(SHA256_BLOCK_SIZE)
+    );
+}
+
 /// Build a coinbase transaction from the provided output pairs and height.
 ///
 /// Example of a coinbase transaction:
@@ -109,6 +184,13 @@ fn append_default_witness_commitment(
 /// When `extranonce` is provided, it replaces the placeholder separator
 /// in the scriptSig. When `None`, the separator placeholder is left in
 /// place (used by the stratum server before split_coinbase).
+///
+/// When `commitment_hash` is provided, the coinbase ends with a padding output
+/// and the commitment output (`commitment_output`), padded so the bytes before
+/// the commitment output are a whole number of SHA256 blocks. The commitment
+/// is then checkable from a SHA256 midstate of that prefix, the hash, the
+/// locktime and the merkle branch -- without the payout outputs.
+#[allow(clippy::too_many_arguments)] // wiring constructor: each parameter is a distinct collaborator, a params struct would only move the list
 pub(crate) fn build_bitcoin_coinbase_transaction(
     version: Version,
     output_data: &[OutputPair],
@@ -136,16 +218,10 @@ pub(crate) fn build_bitcoin_coinbase_transaction(
     let mut signature_buf = PushBytesBuf::with_capacity(pool_signature.len());
     signature_buf.extend_from_slice(pool_signature).unwrap();
 
-    let coinbase_script_prefix = Builder::new()
+    let coinbase_script = Builder::new()
         .push_int(height)
         .push_slice(aux_flags)
-        .push_slice(extranonce_buf);
-
-    let mut coinbase_builder = coinbase_script_prefix;
-    if let Some(hash) = commitment_hash {
-        coinbase_builder = coinbase_builder.push_slice(hash.as_byte_array());
-    };
-    let coinbase_script = coinbase_builder
+        .push_slice(extranonce_buf)
         .push_slice(nsecs.to_le_bytes())
         .push_slice(signature_buf)
         .into_script();
@@ -156,7 +232,7 @@ pub(crate) fn build_bitcoin_coinbase_transaction(
         message: "Error getting locktime from height".into(),
     })?;
 
-    let coinbase_tx = Transaction {
+    let mut coinbase_tx = Transaction {
         version,
         lock_time,
         input: vec![TxIn {
@@ -170,6 +246,9 @@ pub(crate) fn build_bitcoin_coinbase_transaction(
         }],
         output: outputs,
     };
+    if let Some(hash) = commitment_hash {
+        append_commitment_outputs(&mut coinbase_tx, &hash);
+    }
     Ok(coinbase_tx)
 }
 
@@ -200,39 +279,20 @@ pub fn split_coinbase(coinbase: &Transaction) -> Result<(String, String), WorkEr
 
 /// Parses the `coinbase2` hex string to extract the transaction outputs.
 ///
-/// Based on `build_coinbase_transaction` and `split_coinbase`, `coinbase2`
-/// has the following structure:
+/// Based on `build_bitcoin_coinbase_transaction` and `split_coinbase`,
+/// `coinbase2` has the following structure:
 ///
-///  `commitment_hash` (optional: `[0x20] + [32 bytes]`)
 ///  `nsecs` (`[0x08] + [8 bytes]`)
 ///  `pool_signature` (`[len_byte] + [data]`)
 ///  `sequence` (4 bytes)
 ///  `output_count` (CompactSize)
-///  `outputs` (serialized `Vec<TxOut>`)
+///  `outputs` (serialized `Vec<TxOut>`, ending with the padding and
+///  commitment outputs when a commitment is present)
 ///  `lock_time` (4 bytes)
 ///
 /// This function parses this structure to return the `Vec<TxOut>`.
-///
-/// Detect whether a coinbase2 hex string starts with a commitment hash push.
-///
-/// Returns 33 (1 opcode byte + 32 data bytes) when the first byte is 0x20
-/// (a 32-byte push), or 0 when the first byte is 0x08 (the nsecs 8-byte push).
-/// This avoids relying on `share_commitment.is_some()`, which can be None in
-/// solo mode even though the coinbase2 bytes still contain a commitment hash.
-pub fn detect_commitment_hash_len_from_coinbase2(coinbase2_hex: &str) -> usize {
-    // First byte in the hex is at positions 0..2
-    if coinbase2_hex.len() >= 2 && &coinbase2_hex[0..2] == "20" {
-        33
-    } else {
-        0
-    }
-}
-
-/// coinbase2 layout: [commitment_hash?][nsecs][pool_sig][sequence][outputs][locktime]
-/// The commitment_hash_len is 33 when present (1 opcode + 32 bytes), 0 when absent.
 pub fn extract_outputs_from_coinbase2(
     coinbase2_hex: &str,
-    commitment_hash_len: usize,
     pool_signature_len: usize,
 ) -> Result<Vec<TxOut>, WorkError> {
     let coinbase2_bytes = Vec::from_hex(coinbase2_hex).map_err(|_| WorkError {
@@ -241,7 +301,7 @@ pub fn extract_outputs_from_coinbase2(
 
     let nsecs_push_len = 1 + 8; // opcode + 8 bytes for u64
     let pool_sig_push_len = 1 + pool_signature_len;
-    let script_sig_part2_len = commitment_hash_len + nsecs_push_len + pool_sig_push_len;
+    let script_sig_part2_len = nsecs_push_len + pool_sig_push_len;
     let output_data_start_index = script_sig_part2_len + SEQUENCE_LENGTH;
 
     // Bounds check: need at least start_index + LOCKTIME_LENGTH bytes
@@ -260,54 +320,114 @@ pub fn extract_outputs_from_coinbase2(
     })
 }
 
-/// Extracts the commitment hash from the coinbase scriptSig.
+/// Extracts the commitment hash from the coinbase's last output.
 ///
-/// Skips the first three instructions (height, aux_flags, EXTRANONCE_SEPARATOR)
-/// and reads the fourth instruction, which should be a 32-byte push containing
-/// the commitment hash.
+/// The last output must be exactly `OP_RETURN OP_PUSHBYTES_32 <32 bytes>`,
+/// as written by `commitment_output`.
 pub fn extract_commitment_hash_from_coinbase(
     coinbase: &Transaction,
 ) -> Result<sha256::Hash, WorkError> {
-    let input = coinbase.input.first().ok_or_else(|| WorkError {
-        message: "Bitcoin coinbase has no inputs".to_string(),
+    let last_output = coinbase.output.last().ok_or_else(|| WorkError {
+        message: "Bitcoin coinbase has no outputs".to_string(),
     })?;
-
-    let mut instructions = input.script_sig.instructions();
-
-    // Script layout: [height][aux_flags][EXTRANONCE_SEPARATOR][commitment_hash][nsecs][pool_sig]
-    // Skip height, aux_flags, and EXTRANONCE_SEPARATOR (first 3 instructions)
-    for _ in 0..3 {
-        instructions
-            .next()
-            .ok_or_else(|| WorkError {
-                message: "Bitcoin coinbase scriptSig too short".to_string(),
-            })?
-            .map_err(|error| WorkError {
-                message: format!("Invalid bitcoin coinbase scriptSig: {error}"),
-            })?;
+    let script = last_output.script_pubkey.as_bytes();
+    let has_commitment_layout = script.len() == COMMITMENT_SCRIPT_LENGTH
+        && script[0] == OP_RETURN.to_u8()
+        && script[1] == OP_PUSHBYTES_32.to_u8();
+    if !has_commitment_layout {
+        return Err(WorkError {
+            message: "Bitcoin coinbase last output is not a 32-byte commitment".to_string(),
+        });
     }
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&script[2..]);
+    Ok(sha256::Hash::from_byte_array(hash_bytes))
+}
 
-    // Fourth instruction should be the 32-byte commitment hash
-    let commitment_instruction = instructions
-        .next()
-        .ok_or_else(|| WorkError {
-            message: "Bitcoin coinbase scriptSig missing commitment hash".to_string(),
-        })?
-        .map_err(|error| WorkError {
-            message: format!("Invalid bitcoin coinbase scriptSig: {error}"),
-        })?;
+/// The values a bitcoin coinbase carries that its share header does not:
+/// what `build_bitcoin_coinbase_transaction` takes besides the payouts, the
+/// height and the commitment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoinbaseFields {
+    /// The coinbaseaux flags push, the scriptSig's second item.
+    pub(crate) aux_flags: PushBytesBuf,
+    /// The extranonce push (enonce1 || enonce2), the scriptSig's third item.
+    pub(crate) extranonce: Vec<u8>,
+    /// The nanosecond timestamp push, the scriptSig's fourth item.
+    pub(crate) nsecs: u64,
+    /// The pool signature push, the scriptSig's fifth item. It only tags the
+    /// coinbase, so it is read from the block rather than taken from config:
+    /// nodes configured with different signatures still agree on validity.
+    pub(crate) pool_signature: Vec<u8>,
+    /// The BIP141 witness commitment output, if the coinbase has one.
+    pub(crate) witness_commitment: Option<WitnessCommitment>,
+}
 
-    match commitment_instruction {
-        Instruction::PushBytes(bytes) if bytes.len() == 32 => {
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes.copy_from_slice(bytes.as_bytes());
-            Ok(sha256::Hash::from_byte_array(hash_bytes))
+/// Read the values `build_bitcoin_coinbase_transaction` put into a coinbase
+/// that a share header does not carry.
+///
+/// Validation rebuilds the expected coinbase with these and compares it whole
+/// with the coinbase, so this only has to find each value where the builder
+/// writes it: the scriptSig pushes in order, and the witness commitment as the
+/// output before the padding and commitment outputs.
+pub(crate) fn parse_bitcoin_coinbase_fields(
+    coinbase: &Transaction,
+) -> Result<CoinbaseFields, WorkError> {
+    let input = match coinbase.input.as_slice() {
+        [input] => input,
+        _ => {
+            return Err(WorkError {
+                message: "Bitcoin coinbase must have exactly one input".to_string(),
+            });
         }
-        _ => Err(WorkError {
-            message: "Bitcoin coinbase scriptSig does not contain a 32-byte commitment hash"
-                .to_string(),
-        }),
-    }
+    };
+    //* The first push is the height, which the header carries. The next four
+    //* are the aux flags, the extranonce, the nanosecond timestamp and the
+    //* pool signature, which is an empty push when none is configured.
+    let mut pushes = input
+        .script_sig
+        .instructions()
+        .skip(1)
+        .map(|instruction| match instruction {
+            Ok(Instruction::PushBytes(bytes)) => Ok(bytes.as_bytes().to_vec()),
+            _ => Err(WorkError {
+                message: "Bitcoin coinbase scriptSig item is not a data push".to_string(),
+            }),
+        });
+    let mut next_push = |name: &str| {
+        pushes.next().unwrap_or_else(|| {
+            Err(WorkError {
+                message: format!("Bitcoin coinbase scriptSig has no {name}"),
+            })
+        })
+    };
+    let aux_flags = PushBytesBuf::try_from(next_push("aux flags")?).map_err(|_| WorkError {
+        message: "Bitcoin coinbase aux flags are too long".to_string(),
+    })?;
+    let extranonce = next_push("extranonce")?;
+    let nsecs_bytes: [u8; 8] =
+        next_push("nanosecond timestamp")?
+            .try_into()
+            .map_err(|_| WorkError {
+                message: "Bitcoin coinbase nanosecond timestamp is not 8 bytes".to_string(),
+            })?;
+    let pool_signature = next_push("pool signature")?;
+
+    let witness_commitment = coinbase.output.iter().rev().skip(2).find_map(|output| {
+        let script: [u8; WITNESS_COMMITMENT_LENGTH] =
+            output.script_pubkey.as_bytes().try_into().ok()?;
+        script
+            .starts_with(&BIP141_COMMITMENT_HEADER)
+            .then(|| WitnessCommitment::new(script))
+    });
+
+    Ok(CoinbaseFields {
+        aux_flags,
+        extranonce,
+        nsecs: u64::from_le_bytes(nsecs_bytes),
+        pool_signature,
+        witness_commitment,
+    })
 }
 
 #[cfg(test)]
@@ -470,12 +590,12 @@ mod tests {
         let data = include_str!(
             "../../../../p2poolv2_tests/test_data/gbt/regtest/ckpool/four-txns/gbt.json"
         );
-        let template: BlockTemplate = serde_json::from_str(&data).expect("Invalid JSON");
+        let template: BlockTemplate = serde_json::from_str(data).expect("Invalid JSON");
 
         let data = include_str!(
             "../../../../p2poolv2_tests/test_data/gbt/regtest/ckpool/four-txns/notify.json"
         );
-        let _notify: serde_json::Value = serde_json::from_str(&data).expect("Invalid JSON");
+        let _notify: serde_json::Value = serde_json::from_str(data).expect("Invalid JSON");
 
         // Address used in ckpool regtest conf
         let address = parse_address(
@@ -570,12 +690,12 @@ mod tests {
         let data = include_str!(
             "../../../../p2poolv2_tests/test_data/gbt/regtest/ckpool/four-txns/gbt.json"
         );
-        let template: BlockTemplate = serde_json::from_str(&data).expect("Invalid JSON");
+        let template: BlockTemplate = serde_json::from_str(data).expect("Invalid JSON");
 
         let data = include_str!(
             "../../../../p2poolv2_tests/test_data/gbt/regtest/ckpool/four-txns/notify.json"
         );
-        let _notify: serde_json::Value = serde_json::from_str(&data).expect("Invalid JSON");
+        let _notify: serde_json::Value = serde_json::from_str(data).expect("Invalid JSON");
 
         // Address used in ckpool regtest conf
         let address = parse_address(
@@ -640,10 +760,13 @@ mod tests {
         assert_eq!(input.previous_output.vout, u32::MAX);
         assert_eq!(input.sequence, BIP54_COINBASE_SEQUENCE);
         assert_eq!(input.witness.len(), 0); // No witness data in this test
-        assert_eq!(coinbase.output.len(), 3);
+        // 2 payouts, witness commitment, padding, share commitment
+        assert_eq!(coinbase.output.len(), 5);
         let output1 = &coinbase.output[0];
         let output2 = &coinbase.output[1];
         let output3 = &coinbase.output[2];
+        let output4 = &coinbase.output[3];
+        let output5 = &coinbase.output[4];
 
         assert_eq!(output1.value, Amount::from_str("49 BTC").unwrap());
         assert_eq!(output1.script_pubkey, address.script_pubkey());
@@ -657,27 +780,24 @@ mod tests {
             template.default_witness_commitment
         );
 
+        // Padding then the share commitment end the outputs
+        assert_eq!(output4.value, Amount::ZERO);
+        assert!(output4.script_pubkey.is_op_return());
+        assert_eq!(*output5, commitment_output(&share_commitment_cloned.hash()));
+
         // Check the coinbase input script layout:
-        // [height][flags][EXTRANONCE_SEPARATOR][commitment_hash][nsecs][pool_sig]
-        assert_eq!(coinbase.input[0].script_sig.len(), 69);
+        // [height][flags][EXTRANONCE_SEPARATOR][nsecs][pool_sig]
+        assert_eq!(coinbase.input[0].script_sig.len(), 36);
         let script_bytes = coinbase.input[0].script_sig.as_bytes();
         assert_eq!(script_bytes[0], 2);
         assert_eq!(script_bytes[1..3].as_hex().to_string(), "fa01"); // Height 506 in little-endian
         assert_eq!(script_bytes[3..5].as_hex().to_string(), "0100"); // Flags (empty in this case)
         assert_eq!(script_bytes[5..6].as_hex().to_string(), "0c"); // Extranonce separator length (12 bytes)
         assert_eq!(script_bytes[6..18], EXTRANONCE_SEPARATOR); // Extranonce separator
-        assert_eq!(script_bytes[18..19].as_hex().to_string(), "20"); // Commitment hash length (32 bytes)
+        assert_eq!(script_bytes[18..19].as_hex().to_string(), "08"); // Timestamp length (8 bytes for u64 nanos)
+        assert_eq!(script_bytes[27], 8u8); // Pool signature length
         assert_eq!(
-            script_bytes[19..51].as_hex().to_string(),
-            share_commitment_cloned
-                .hash()
-                .as_byte_array()
-                .to_lower_hex_string()
-        ); // Share commitment hash
-        assert_eq!(script_bytes[51..52].as_hex().to_string(), "08"); // Timestamp length (8 bytes for u64 nanos)
-        assert_eq!(script_bytes[60], 8u8); // Pool signature length
-        assert_eq!(
-            &script_bytes[61..69],
+            &script_bytes[28..36],
             b"P2Poolv2", // Check the pool signature
         );
     }
@@ -739,7 +859,7 @@ mod tests {
 
         //  Parse
         let extracted_outputs =
-            extract_outputs_from_coinbase2(&coinbase2_hex, 0, pool_sig.len()).unwrap();
+            extract_outputs_from_coinbase2(&coinbase2_hex, pool_sig.len()).unwrap();
 
         //  Verify
         assert_eq!(extracted_outputs, expected_outputs);
@@ -757,28 +877,28 @@ mod tests {
     #[test]
     fn test_extract_outputs_from_coinbase2_bounds_checking() {
         // Test empty input
-        let result = extract_outputs_from_coinbase2("", 0, 8);
+        let result = extract_outputs_from_coinbase2("", 8);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("too short"));
 
         // Test input that's too short for the expected structure
-        // With commitment_hash_len=0, pool_signature_len=8:
-        // min_len = 0 + 17(nsecs) + 9(pool_sig) + 4(seq) + 4(locktime) = 34 bytes = 68 hex chars
+        // With pool_signature_len=8:
+        // min_len = 9(nsecs) + 9(pool_sig) + 4(seq) + 4(locktime) = 26 bytes = 52 hex chars
         let short_hex = "00112233445566778899aabbccddeeff"; // 16 bytes = 32 hex chars
-        let result = extract_outputs_from_coinbase2(short_hex, 0, 8);
+        let result = extract_outputs_from_coinbase2(short_hex, 8);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("too short"));
 
         // Test exactly at minimum length (should fail on deserialize, not bounds)
-        // Need 34 bytes minimum: 68 hex chars
-        let min_hex = hex::encode([0u8; 34]);
-        let result = extract_outputs_from_coinbase2(&min_hex, 0, 8);
+        // Need 26 bytes minimum: 52 hex chars
+        let min_hex = hex::encode([0u8; 26]);
+        let result = extract_outputs_from_coinbase2(&min_hex, 8);
         assert!(result.is_err());
         // This should fail on deserialize, not bounds check
         assert!(result.unwrap_err().message.contains("Bad outputs"));
 
         // Test invalid hex
-        let result = extract_outputs_from_coinbase2("not_valid_hex!", 0, 8);
+        let result = extract_outputs_from_coinbase2("not_valid_hex!", 8);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("parsing coinbase hex"));
     }
@@ -822,6 +942,148 @@ mod tests {
         assert_eq!(extracted_hash, expected_hash);
     }
 
+    /// The parser returns exactly what the builder was given, so a coinbase
+    /// rebuilt from the parsed values is the coinbase itself.
+    #[test]
+    fn test_parse_bitcoin_coinbase_fields_returns_builder_inputs() {
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let witness_commitment = WitnessCommitment::from_hex(
+            "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9",
+        )
+        .unwrap();
+        let extranonce = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        ];
+        let outputs = [OutputPair {
+            address,
+            amount: Amount::from_str("50 BTC").unwrap(),
+        }];
+        let commitment_hash = create_test_commitment().hash();
+
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &outputs,
+            200,
+            PushBytesBuf::from(&[0x01, 0x02, 0x03]),
+            Some(&witness_commitment),
+            b"OtherPool",
+            Some(commitment_hash),
+            1_700_000_000_123_456_789,
+            Some(&extranonce),
+        )
+        .unwrap();
+
+        let fields = parse_bitcoin_coinbase_fields(&coinbase).unwrap();
+
+        assert_eq!(fields.aux_flags.as_bytes(), [0x01, 0x02, 0x03]);
+        assert_eq!(fields.extranonce, extranonce);
+        assert_eq!(fields.nsecs, 1_700_000_000_123_456_789);
+        assert_eq!(fields.pool_signature, b"OtherPool");
+        assert_eq!(fields.witness_commitment, Some(witness_commitment));
+        let rebuilt = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &outputs,
+            200,
+            fields.aux_flags,
+            fields.witness_commitment.as_ref(),
+            &fields.pool_signature,
+            Some(commitment_hash),
+            fields.nsecs,
+            Some(&fields.extranonce),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, coinbase);
+    }
+
+    #[test]
+    fn test_parse_bitcoin_coinbase_fields_without_witness_commitment() {
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &[OutputPair {
+                address,
+                amount: Amount::from_str("50 BTC").unwrap(),
+            }],
+            200,
+            PushBytesBuf::from(&[0u8]),
+            None,
+            b"P2Poolv2",
+            Some(create_test_commitment().hash()),
+            1,
+            None,
+        )
+        .unwrap();
+
+        let fields = parse_bitcoin_coinbase_fields(&coinbase).unwrap();
+
+        assert_eq!(fields.witness_commitment, None);
+    }
+
+    /// A node with no pool signature configured pushes an empty one, which
+    /// is written as OP_0 and must still read back as an empty signature.
+    #[test]
+    fn test_parse_bitcoin_coinbase_fields_reads_empty_pool_signature() {
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let outputs = [OutputPair {
+            address,
+            amount: Amount::from_str("50 BTC").unwrap(),
+        }];
+        let commitment_hash = create_test_commitment().hash();
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &outputs,
+            200,
+            PushBytesBuf::from(&[0u8]),
+            None,
+            b"",
+            Some(commitment_hash),
+            1,
+            None,
+        )
+        .unwrap();
+
+        let fields = parse_bitcoin_coinbase_fields(&coinbase).unwrap();
+
+        assert!(fields.pool_signature.is_empty());
+        let rebuilt = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &outputs,
+            200,
+            fields.aux_flags,
+            None,
+            &fields.pool_signature,
+            Some(commitment_hash),
+            fields.nsecs,
+            Some(&fields.extranonce),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, coinbase);
+    }
+
+    #[test]
+    fn test_parse_bitcoin_coinbase_fields_rejects_coinbase_without_inputs() {
+        let coinbase = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+
+        assert!(parse_bitcoin_coinbase_fields(&coinbase).is_err());
+    }
+
     #[test]
     fn test_extract_commitment_hash_from_coinbase_without_commitment() {
         let address = parse_address(
@@ -852,12 +1114,12 @@ mod tests {
             result
                 .unwrap_err()
                 .message
-                .contains("does not contain a 32-byte commitment hash")
+                .contains("is not a 32-byte commitment")
         );
     }
 
     #[test]
-    fn test_extract_commitment_hash_from_coinbase_empty_inputs() {
+    fn test_extract_commitment_hash_from_coinbase_empty_outputs() {
         let coinbase = Transaction {
             version: Version(1),
             lock_time: LockTime::ZERO,
@@ -867,6 +1129,181 @@ mod tests {
 
         let result = extract_commitment_hash_from_coinbase(&coinbase);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("no inputs"));
+        assert!(result.unwrap_err().message.contains("no outputs"));
+    }
+
+    /// The commitment is the last output and the BIP141 witness commitment is
+    /// still the highest-index output matching the witness pattern, so bitcoin
+    /// finds the same witness commitment it would without ours.
+    #[test]
+    fn test_coinbase_ends_with_commitment_after_witness_commitment() {
+        let data = include_str!(
+            "../../../../p2poolv2_tests/test_data/gbt/regtest/ckpool/four-txns/gbt.json"
+        );
+        let template: BlockTemplate = serde_json::from_str(data).expect("Invalid JSON");
+        let witness_commitment = template
+            .default_witness_commitment
+            .as_deref()
+            .and_then(|hex_str| WitnessCommitment::from_hex(hex_str).ok())
+            .expect("four-txns template has a witness commitment");
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let commitment_hash = create_test_commitment().hash();
+
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &[OutputPair {
+                address,
+                amount: Amount::from_str("50 BTC").unwrap(),
+            }],
+            template.height as i64,
+            PushBytesBuf::from(&[0u8]),
+            Some(&witness_commitment),
+            b"P2Poolv2",
+            Some(commitment_hash),
+            get_timestamp_bytes(&SystemTimeProvider),
+            None,
+        )
+        .unwrap();
+
+        // payout, witness commitment, padding, commitment
+        assert_eq!(coinbase.output.len(), 4);
+        assert_eq!(coinbase.output[3], commitment_output(&commitment_hash));
+        assert_eq!(coinbase.output[2].value, Amount::ZERO);
+        assert!(coinbase.output[2].script_pubkey.is_op_return());
+
+        let witness_pattern = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        let last_witness_match = coinbase.output.iter().rposition(|output| {
+            output
+                .script_pubkey
+                .as_bytes()
+                .starts_with(&witness_pattern)
+        });
+        assert_eq!(last_witness_match, Some(1));
+        assert_eq!(
+            coinbase.output[1].script_pubkey,
+            witness_commitment.to_script_buf()
+        );
+        assert_eq!(
+            extract_commitment_hash_from_coinbase(&coinbase).unwrap(),
+            commitment_hash
+        );
+    }
+
+    /// The padding fills only the shortfall to the next block boundary.
+    #[test]
+    fn test_padding_to_block_boundary() {
+        assert_eq!(padding_to_block_boundary(0), 0);
+        assert_eq!(padding_to_block_boundary(1), 63);
+        assert_eq!(padding_to_block_boundary(63), 1);
+        assert_eq!(padding_to_block_boundary(64), 0);
+        assert_eq!(padding_to_block_boundary(65), 63);
+    }
+
+    /// With one payout the bytes before the commitment output are a whole
+    /// number of SHA256 blocks, and the bytes after are exactly the
+    /// commitment output and locktime.
+    #[test]
+    fn test_coinbase_prefix_is_block_aligned_with_one_payout() {
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let commitment_hash = create_test_commitment().hash();
+
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &[OutputPair {
+                address,
+                amount: Amount::from_str("50 BTC").unwrap(),
+            }],
+            100,
+            PushBytesBuf::from(&[0u8]),
+            None,
+            b"P2Poolv2",
+            Some(commitment_hash),
+            get_timestamp_bytes(&SystemTimeProvider),
+            None,
+        )
+        .unwrap();
+
+        let serialized = serialize(&coinbase);
+        let prefix_length = serialized.len() - COMMITMENT_TAIL_LENGTH;
+        assert_eq!(prefix_length % SHA256_BLOCK_SIZE, 0);
+        let mut expected_tail = serialize(&commitment_output(&commitment_hash));
+        expected_tail.extend_from_slice(&serialize(&coinbase.lock_time));
+        assert_eq!(&serialized[prefix_length..], expected_tail.as_slice());
+    }
+
+    /// Twenty payouts shift the prefix length; the padding still aligns it.
+    #[test]
+    fn test_coinbase_prefix_is_block_aligned_with_many_payouts() {
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let mut output_pairs = Vec::with_capacity(20);
+        for _ in 0..20 {
+            output_pairs.push(OutputPair {
+                address: address.clone(),
+                amount: Amount::from_str("2.5 BTC").unwrap(),
+            });
+        }
+
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &output_pairs,
+            100,
+            PushBytesBuf::from(&[0u8]),
+            None,
+            b"P2Poolv2",
+            Some(create_test_commitment().hash()),
+            get_timestamp_bytes(&SystemTimeProvider),
+            None,
+        )
+        .unwrap();
+
+        let prefix_length = serialize(&coinbase).len() - COMMITMENT_TAIL_LENGTH;
+        assert_eq!(prefix_length % SHA256_BLOCK_SIZE, 0);
+    }
+
+    /// 300 payouts take the output count past 252, where its CompactSize
+    /// encoding grows from one byte to three; the padding still aligns the
+    /// prefix.
+    #[test]
+    fn test_coinbase_prefix_is_block_aligned_with_three_byte_output_count() {
+        let address = parse_address(
+            "bcrt1qe2qaq0e8qlp425pxytrakala7725dynwhknufr",
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let mut output_pairs = Vec::with_capacity(300);
+        for _ in 0..300 {
+            output_pairs.push(OutputPair {
+                address: address.clone(),
+                amount: Amount::from_sat(1_000_000),
+            });
+        }
+
+        let coinbase = build_bitcoin_coinbase_transaction(
+            Version::TWO,
+            &output_pairs,
+            100,
+            PushBytesBuf::from(&[0u8]),
+            None,
+            b"P2Poolv2",
+            Some(create_test_commitment().hash()),
+            get_timestamp_bytes(&SystemTimeProvider),
+            None,
+        )
+        .unwrap();
+
+        let prefix_length = serialize(&coinbase).len() - COMMITMENT_TAIL_LENGTH;
+        assert_eq!(prefix_length % SHA256_BLOCK_SIZE, 0);
     }
 }

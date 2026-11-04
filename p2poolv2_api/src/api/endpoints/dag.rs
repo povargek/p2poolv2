@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::api::endpoints::MAX_NUM_SHARES_IN_RESPONSE;
 use crate::api::error::ApiError;
@@ -21,7 +9,7 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use p2poolv2_lib::store::dag_store::DagEntry;
+use p2poolv2_lib::address_display::DagEntryDisplay;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -39,7 +27,7 @@ pub struct DagQuery {
 pub struct DagResponse {
     pub from_height: u32,
     pub to_height: u32,
-    pub entries: Vec<DagEntry>,
+    pub entries: Vec<DagEntryDisplay>,
 }
 
 /// Returns all share headers in the height index for a range of heights.
@@ -96,7 +84,7 @@ pub(crate) async fn dag(
     Ok(Json(DagResponse {
         from_height,
         to_height,
-        entries,
+        entries: DagEntryDisplay::from_dag_entries(&entries, Some(state.app_config.network)),
     }))
 }
 
@@ -105,7 +93,9 @@ mod tests {
     use super::*;
     use crate::api::server::{AppConfig, AppState};
     use axum::extract::{Query, State};
+    use bitcoin::Network;
     use p2poolv2_lib::accounting::stats::metrics;
+    use p2poolv2_lib::address::witness_program_codec::to_address_string;
     use p2poolv2_lib::monitoring_events::create_monitoring_event_channel;
     use p2poolv2_lib::node::actor::NodeHandle;
     use p2poolv2_lib::stratum::work::tracker::start_tracker_actor;
@@ -188,7 +178,39 @@ mod tests {
         assert_eq!(response.to_height, 0);
         assert_eq!(response.entries.len(), 1);
         assert_eq!(response.entries[0].blockhash, genesis.block_hash());
-        assert_eq!(response.entries[0].status, "Confirmed");
+        assert_eq!(response.entries[0].validation_status, "HeaderValid");
+        assert_eq!(response.entries[0].chain, "Confirmed");
         assert!(response.entries[0].has_block_data);
+    }
+    /// The miner address must reach the wire in bech32m form for the pool's
+    /// network, not as the witness program hex the store serializes. Nothing
+    /// in the type system separates the two: both are strings, so only a test
+    /// keeps the rendering from silently regressing.
+    #[tokio::test]
+    async fn test_dag_renders_miner_addresses() {
+        let node_handle = NodeHandle::new_for_test();
+        let (state, _temp_dir) = build_test_state(node_handle).await;
+
+        let genesis = genesis_for_tests();
+        let expected = to_address_string(&genesis.header.miner_address, Network::Signet);
+        state
+            .chain_store_handle
+            .init_or_setup_genesis(genesis)
+            .await
+            .unwrap();
+
+        let query = Query(DagQuery {
+            to: Some(0),
+            num: Some(1),
+        });
+
+        let response = dag(State(state), query).await.unwrap().0;
+        let miner_address = response.entries[0].miner_address.as_deref();
+
+        assert_eq!(miner_address, Some(expected.as_str()));
+        assert!(
+            miner_address.unwrap().starts_with("sp2pool1"),
+            "expected a signet share address, got {miner_address:?}"
+        );
     }
 }

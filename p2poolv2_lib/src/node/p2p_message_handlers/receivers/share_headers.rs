@@ -1,19 +1,8 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::node::messages::ShareHeaderBatch;
 use crate::node::p2p_message_handlers::MAX_HEADERS_IN_RESPONSE;
 use crate::node::p2p_message_handlers::senders::send_getheaders;
 use crate::node::request_response_handler::block_fetcher::{BlockFetcherEvent, BlockFetcherHandle};
@@ -190,18 +179,23 @@ impl From<crate::shares::validation::ValidationError> for HeaderSyncError {
 ///   - Cumulative chain work exceeds minimum threshold
 ///
 /// Phase 2 -- Organise:
+///   - Before organising each header, validate its uncles (count, duplicates,
+///     positions, reuse by an ancestor). Organising credits uncle work to chain
+///     work, so this cannot wait for the body. Earlier headers in the batch are
+///     already organised, so the check sees them.
 ///   - Store validated headers via organise_header (persists metadata for later
 ///     validate_with_pool_difficulty in validate_share_block)
 ///
 /// Then either request more headers or trigger block fetch.
 pub async fn handle_share_headers<C: Send + Sync>(
     peer_id: libp2p::PeerId,
-    share_headers: Vec<ShareHeader>,
+    header_batch: ShareHeaderBatch,
     chain_store_handle: ChainStoreHandle,
     swarm_tx: mpsc::Sender<SwarmSend<C>>,
     block_fetcher_handle: BlockFetcherHandle,
     share_validator: &(dyn ShareValidator + Send + Sync),
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let share_headers = header_batch.headers();
     debug!("Received {} ShareHeaders", share_headers.len());
     if !share_headers.is_empty() {
         let first = &share_headers[0];
@@ -223,11 +217,16 @@ pub async fn handle_share_headers<C: Send + Sync>(
 
     // Phase 1: Validate the header chain in memory
     if let Err(sync_error) =
-        validate_header_chain(&share_headers, &chain_store_handle, share_validator)
+        validate_header_chain(&header_batch, &chain_store_handle, share_validator)
     {
         if sync_error.is_retryable() {
+            // The depth is subtracted from build_locator's start height, which
+            // is the candidate tip, so it must be measured against the same
+            // base. Measuring it against the confirmed tip would anchor the
+            // retry higher than intended -- a shallower locator, defeating a
+            // retry whose purpose is to reach further back.
             let tip_height = chain_store_handle
-                .get_tip_height()
+                .get_candidate_tip_height()
                 .ok()
                 .flatten()
                 .unwrap_or(0);
@@ -245,8 +244,20 @@ pub async fn handle_share_headers<C: Send + Sync>(
         return Err(sync_error.into());
     }
 
-    // Phase 2: Organise validated headers into the candidate chain
-    for header in &share_headers {
+    // Phase 2: Store each header's coinbase merkle branch, so headers held
+    // without their bodies can be served on with the branch their proof needs,
+    // then organise the validated headers into the candidate chain.
+    chain_store_handle
+        .add_header_template_merkle_branches(header_batch.blockhashes_with_branches())
+        .await?;
+    for header in share_headers {
+        if let Err(error) = share_validator.validate_uncles(header, &chain_store_handle) {
+            error!(
+                "Rejecting header {} from peer {peer_id}: {error}",
+                header.block_hash()
+            );
+            return Err(error.into());
+        }
         chain_store_handle.organise_header(header.clone()).await?;
     }
 
@@ -254,7 +265,7 @@ pub async fn handle_share_headers<C: Send + Sync>(
 
     trigger_or_request(
         peer_id,
-        &share_headers,
+        share_headers,
         &first_blockhash,
         &chain_store_handle,
         &swarm_tx,
@@ -267,14 +278,16 @@ pub async fn handle_share_headers<C: Send + Sync>(
 ///
 /// The batch contains a mix of main chain and uncle headers. Validation
 /// checks that the batch forms a connected DAG (every header's parent is
-/// either earlier in the batch or in the store), that every header meets
-/// ASERT difficulty, that all declared uncle hashes are available, and
+/// either earlier in the batch or in the store), that every header is bound
+/// to its proof of work by its coinbase proof and meets ASERT difficulty,
+/// that every declared uncle is earlier in the batch or in the store, and
 /// that cumulative work exceeds the minimum threshold.
 fn validate_header_chain(
-    share_headers: &[ShareHeader],
+    header_batch: &ShareHeaderBatch,
     chain_store_handle: &ChainStoreHandle,
     share_validator: &(dyn ShareValidator + Send + Sync),
 ) -> Result<(), HeaderSyncError> {
+    let share_headers = header_batch.headers();
     let pool_difficulty = share_validator.pool_difficulty();
 
     let anchors = find_chain_anchors(share_headers, chain_store_handle)?;
@@ -293,17 +306,11 @@ fn validate_header_chain(
         .max()
         .unwrap_or(Work::from_hex("0x00").unwrap());
 
-    let (batch_hashes, cumulative_chain_work) = validate_dag_connectivity_and_difficulty(
-        share_headers,
+    let cumulative_chain_work = validate_dag_connectivity_and_difficulty(
+        header_batch,
         share_validator,
         pool_difficulty,
         &anchor_hashes,
-        chain_store_handle,
-        lowest_anchor_height,
-    )?;
-    verify_all_uncles_available(
-        share_headers,
-        &batch_hashes,
         chain_store_handle,
         lowest_anchor_height,
     )?;
@@ -339,20 +346,23 @@ fn get_share_time_and_height(
 
 /// Validate that the batch forms a connected DAG with valid difficulty.
 ///
-/// Every header's parent must be either already processed in this batch
-/// or present in the store. Every header must pass minimum difficulty
-/// and ASERT target validation.
+/// Every header's parent and every uncle it declares must be either
+/// already processed in this batch or present in the store. Headers are
+/// organised in batch order, and organising a header reads its uncles'
+/// headers to add their work, so an uncle delivered after its nephew is
+/// missing. Every header must pass minimum difficulty, its coinbase proof
+/// against the batch's branch for it, and ASERT target validation.
 ///
-/// Returns the set of all blockhashes in the batch and the cumulative
-/// work across all headers.
+/// Returns the cumulative work across all headers.
 fn validate_dag_connectivity_and_difficulty(
-    share_headers: &[ShareHeader],
+    header_batch: &ShareHeaderBatch,
     share_validator: &(dyn ShareValidator + Send + Sync),
     pool_difficulty: &PoolDifficulty,
     anchor_hashes: &HashSet<BlockHash>,
     chain_store_handle: &ChainStoreHandle,
     lowest_anchor_height: u32,
-) -> Result<(HashSet<BlockHash>, Work), HeaderSyncError> {
+) -> Result<Work, HeaderSyncError> {
+    let share_headers = header_batch.headers();
     let mut known_hashes: HashSet<BlockHash> =
         HashSet::with_capacity(share_headers.len() + anchor_hashes.len());
     known_hashes.extend(anchor_hashes);
@@ -362,8 +372,9 @@ fn validate_dag_connectivity_and_difficulty(
         HashMap::with_capacity(share_headers.len() + 1);
     let mut blocks_per_height: HashMap<u32, usize> = HashMap::with_capacity(64);
 
-    for header in share_headers {
+    for (position, header) in share_headers.iter().enumerate() {
         share_validator.validate_header_minimum_difficulty(header)?;
+        share_validator.validate_coinbase_proof(header, header_batch.branch(position))?;
 
         let parent_hash = header.prev_share_blockhash;
         if !known_hashes.contains(&parent_hash)
@@ -390,6 +401,12 @@ fn validate_dag_connectivity_and_difficulty(
 
         let header_height = parent_height + 1;
         check_dense_height(&mut blocks_per_height, header_height)?;
+        check_uncles_known(
+            header,
+            &known_hashes,
+            chain_store_handle,
+            lowest_anchor_height,
+        )?;
 
         let header_hash = header.block_hash();
         time_height_cache.insert(header_hash, (header.time, header_height));
@@ -397,7 +414,7 @@ fn validate_dag_connectivity_and_difficulty(
         cumulative_work = cumulative_work + header.get_work();
     }
 
-    Ok((known_hashes, cumulative_work))
+    Ok(cumulative_work)
 }
 
 /// Reject batches where a single height has too many blocks.
@@ -419,25 +436,23 @@ fn check_dense_height(
     Ok(())
 }
 
-/// Verify every uncle hash declared by any header in the batch exists
-/// either as another header in this batch or in the store. Catches
-/// phantom uncle references that no peer ever sent.
-fn verify_all_uncles_available(
-    share_headers: &[ShareHeader],
-    batch_hashes: &HashSet<BlockHash>,
+/// Verify every uncle declared by `header` is a header already processed
+/// in this batch or is in the store. Catches phantom uncle references that
+/// no peer ever sent, and uncles delivered after their nephew.
+fn check_uncles_known(
+    header: &ShareHeader,
+    known_hashes: &HashSet<BlockHash>,
     chain_store_handle: &ChainStoreHandle,
     lowest_anchor_height: u32,
 ) -> Result<(), HeaderSyncError> {
-    for header in share_headers {
-        for uncle_hash in &header.uncles {
-            if !batch_hashes.contains(uncle_hash)
-                && chain_store_handle.get_block_metadata(uncle_hash).is_err()
-            {
-                return Err(HeaderSyncError::MissingUncle {
-                    uncle_hash: *uncle_hash,
-                    lowest_anchor_height,
-                });
-            }
+    for uncle_hash in &header.uncles {
+        if !known_hashes.contains(uncle_hash)
+            && chain_store_handle.get_block_metadata(uncle_hash).is_err()
+        {
+            return Err(HeaderSyncError::MissingUncle {
+                uncle_hash: *uncle_hash,
+                lowest_anchor_height,
+            });
         }
     }
     Ok(())
@@ -468,7 +483,9 @@ fn find_chain_anchors(
         .into_iter()
         .collect();
 
-    let metadata_results = chain_store_handle.get_block_metadata_batch(&external_parents);
+    let metadata_results = chain_store_handle
+        .get_block_metadata_batch(&external_parents)
+        .map_err(|error| HeaderSyncError::Other(Box::new(error)))?;
 
     if metadata_results.len() != external_parents.len() {
         let found: HashSet<BlockHash> = metadata_results.iter().map(|(hash, _)| *hash).collect();
@@ -518,7 +535,7 @@ async fn trigger_or_request<C: Send + Sync>(
     block_fetcher_handle: &BlockFetcherHandle,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if share_headers.len() < MAX_HEADERS_IN_RESPONSE {
-        let scan_start_height = chain_store_handle
+        let fork_height = chain_store_handle
             .find_fork_point_height(first_blockhash)
             .unwrap_or_else(|error| {
                 warn!(
@@ -531,7 +548,7 @@ async fn trigger_or_request<C: Send + Sync>(
             peer_id,
             chain_store_handle,
             block_fetcher_handle,
-            scan_start_height,
+            fork_height,
         )
         .await
     } else {
@@ -549,11 +566,10 @@ async fn trigger_block_fetch(
     peer_id: libp2p::PeerId,
     chain_store_handle: &ChainStoreHandle,
     block_fetcher_handle: &BlockFetcherHandle,
-    scan_start_height: Option<u32>,
+    fork_height: Option<u32>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     debug!("Header sync complete, triggering block fetch for missing data");
-    let missing_blockhashes =
-        chain_store_handle.get_candidate_blocks_missing_data(scan_start_height)?;
+    let missing_blockhashes = chain_store_handle.get_candidate_blocks_missing_data(fork_height)?;
     if !missing_blockhashes.is_empty() {
         debug!(
             "Requesting {} blocks from block fetcher",
@@ -611,9 +627,9 @@ mod tests {
     use crate::node::request_response_handler::block_fetcher;
     #[mockall_double::double]
     use crate::shares::chain::chain_store_handle::ChainStoreHandle;
-    use crate::shares::validation::MockDefaultShareValidator;
-    use crate::store::block_tx_metadata::{BlockMetadata, Status};
-    use crate::test_utils::TestShareBlockBuilder;
+    use crate::shares::validation::{MockDefaultShareValidator, ValidationError};
+    use crate::store::block_tx_metadata::{BlockMetadata, ChainMembership, Status};
+    use crate::test_utils::{TestShareBlockBuilder, share_header_batch_with_empty_branches};
     use tokio::sync::{mpsc, oneshot};
 
     /// Build a single test header with bits set to MAX_POOL_TARGET so it
@@ -643,13 +659,14 @@ mod tests {
                 Ok(BlockMetadata {
                     expected_height: Some(0),
                     chain_work: Work::from_hex("0x00").unwrap(),
-                    status: Status::Confirmed,
+                    status: Status::BlockValid,
+                    chain: ChainMembership::Confirmed,
                 })
             });
         chain_store_handle
             .expect_get_block_metadata_batch()
             .returning(|hashes| {
-                hashes
+                Ok(hashes
                     .iter()
                     .map(|hash| {
                         (
@@ -657,11 +674,12 @@ mod tests {
                             BlockMetadata {
                                 expected_height: Some(0),
                                 chain_work: Work::from_hex("0x00").unwrap(),
-                                status: Status::Confirmed,
+                                status: Status::BlockValid,
+                                chain: ChainMembership::Confirmed,
                             },
                         )
                     })
-                    .collect()
+                    .collect())
             });
     }
 
@@ -669,6 +687,9 @@ mod tests {
         mock_validator
             .expect_validate_header_minimum_difficulty()
             .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_coinbase_proof()
+            .returning(|_, _| Ok(()));
         let mut pool_difficulty = PoolDifficulty::default();
         pool_difficulty
             .expect_calculate_target_clamped()
@@ -686,6 +707,9 @@ mod tests {
             .expect_organise_header()
             .returning(|_| Ok(None));
         chain_store_handle
+            .expect_add_header_template_merkle_branches()
+            .returning(|_| Ok(()));
+        chain_store_handle
             .expect_find_fork_point_height()
             .returning(|_| Ok(Some(0)));
         chain_store_handle
@@ -699,12 +723,15 @@ mod tests {
 
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
+        mock_validator
+            .expect_validate_uncles()
+            .returning(|_, _| Ok(()));
 
         let share_headers = vec![build_valid_test_header()];
 
         let result = handle_share_headers(
             peer_id,
-            share_headers,
+            share_header_batch_with_empty_branches(share_headers),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -714,6 +741,148 @@ mod tests {
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
 
         assert!(swarm_rx.try_recv().is_err());
+    }
+
+    /// A header whose coinbase proof fails rejects the batch before anything
+    /// is stored or organised: a bitcoin header replayed under other share
+    /// fields never reaches the candidate chain.
+    #[tokio::test]
+    async fn test_handle_share_headers_rejects_header_with_invalid_coinbase_proof() {
+        let peer_id = libp2p::PeerId::random();
+        let mut chain_store_handle = ChainStoreHandle::default();
+        setup_chain_validation_mocks(&mut chain_store_handle);
+
+        let (swarm_tx, _swarm_rx) = mpsc::channel::<SwarmSend<oneshot::Sender<Message>>>(32);
+        let (block_fetcher_handle, _block_fetcher_rx) =
+            block_fetcher::create_block_fetcher_channel();
+
+        let mut mock_validator = MockDefaultShareValidator::default();
+        mock_validator
+            .expect_validate_header_minimum_difficulty()
+            .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_coinbase_proof()
+            .returning(|_, _| {
+                Err(ValidationError::consensus(
+                    "Invalid coinbase proof: proof gives merkle root a, bitcoin header has b",
+                ))
+            });
+        let pool_difficulty = PoolDifficulty::default();
+        mock_validator
+            .expect_pool_difficulty()
+            .return_const(pool_difficulty);
+
+        let result = handle_share_headers(
+            peer_id,
+            share_header_batch_with_empty_branches(vec![build_valid_test_header()]),
+            chain_store_handle,
+            swarm_tx,
+            block_fetcher_handle,
+            &mock_validator,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("coinbase proof"));
+    }
+
+    /// Each validated header's branch is stored before the headers are
+    /// organised, so the node can serve headers it holds without bodies.
+    #[tokio::test]
+    async fn test_handle_share_headers_stores_branches_of_validated_headers() {
+        let peer_id = libp2p::PeerId::random();
+        let header = build_valid_test_header();
+        let branch = vec![bitcoin::TxMerkleNode::from_byte_array([0x42; 32])];
+        let expected_entries = vec![(header.block_hash(), branch.clone())];
+
+        let mut chain_store_handle = ChainStoreHandle::default();
+        chain_store_handle
+            .expect_add_header_template_merkle_branches()
+            .withf(move |entries| *entries == expected_entries)
+            .times(1)
+            .returning(|_| Ok(()));
+        chain_store_handle
+            .expect_organise_header()
+            .returning(|_| Ok(None));
+        chain_store_handle
+            .expect_find_fork_point_height()
+            .returning(|_| Ok(Some(0)));
+        chain_store_handle
+            .expect_get_candidate_blocks_missing_data()
+            .returning(|_| Ok(Vec::new()));
+        setup_chain_validation_mocks(&mut chain_store_handle);
+
+        let (swarm_tx, _swarm_rx) = mpsc::channel::<SwarmSend<oneshot::Sender<Message>>>(32);
+        let (block_fetcher_handle, _block_fetcher_rx) =
+            block_fetcher::create_block_fetcher_channel();
+
+        let mut mock_validator = MockDefaultShareValidator::default();
+        setup_minimum_difficulty_mock(&mut mock_validator);
+        mock_validator
+            .expect_validate_uncles()
+            .returning(|_, _| Ok(()));
+
+        let result = handle_share_headers(
+            peer_id,
+            ShareHeaderBatch::from_headers_with_branches(vec![(header, branch)]),
+            chain_store_handle,
+            swarm_tx,
+            block_fetcher_handle,
+            &mock_validator,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
+    }
+
+    /// Organising a header credits its uncles' work to chain work, so a header
+    /// whose uncles break a consensus rule must be rejected before it is
+    /// organised, not only once its body is validated.
+    #[tokio::test]
+    async fn test_handle_share_headers_rejects_invalid_uncles_before_organising() {
+        let peer_id = libp2p::PeerId::random();
+        let header = build_valid_test_header();
+        let branch = vec![bitcoin::TxMerkleNode::from_byte_array([0x42; 32])];
+
+        let mut chain_store_handle = ChainStoreHandle::default();
+        chain_store_handle
+            .expect_add_header_template_merkle_branches()
+            .returning(|_| Ok(()));
+        chain_store_handle.expect_organise_header().times(0);
+        setup_chain_validation_mocks(&mut chain_store_handle);
+
+        let (swarm_tx, _swarm_rx) = mpsc::channel::<SwarmSend<oneshot::Sender<Message>>>(32);
+        let (block_fetcher_handle, _block_fetcher_rx) =
+            block_fetcher::create_block_fetcher_channel();
+
+        let mut mock_validator = MockDefaultShareValidator::default();
+        setup_minimum_difficulty_mock(&mut mock_validator);
+        mock_validator
+            .expect_validate_uncles()
+            .times(1)
+            .returning(|_, _| {
+                Err(ValidationError::consensus(
+                    "Uncle is already listed by an ancestor of the nephew",
+                ))
+            });
+
+        let result = handle_share_headers(
+            peer_id,
+            ShareHeaderBatch::from_headers_with_branches(vec![(header, branch)]),
+            chain_store_handle,
+            swarm_tx,
+            block_fetcher_handle,
+            &mock_validator,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already listed by an ancestor")
+        );
     }
 
     #[tokio::test]
@@ -732,7 +901,7 @@ mod tests {
 
         let result = handle_share_headers(
             peer_id,
-            share_headers,
+            share_header_batch_with_empty_branches(share_headers),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -751,6 +920,9 @@ mod tests {
         chain_store_handle
             .expect_organise_header()
             .returning(|_| Ok(None));
+        chain_store_handle
+            .expect_add_header_template_merkle_branches()
+            .returning(|_| Ok(()));
         setup_chain_validation_mocks(&mut chain_store_handle);
 
         let (swarm_tx, mut swarm_rx) = mpsc::channel::<SwarmSend<oneshot::Sender<Message>>>(32);
@@ -759,6 +931,9 @@ mod tests {
 
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
+        mock_validator
+            .expect_validate_uncles()
+            .returning(|_, _| Ok(()));
 
         let first = build_valid_test_header();
         let mut parent_hash = first.prev_share_blockhash;
@@ -777,7 +952,7 @@ mod tests {
 
         let result = handle_share_headers(
             peer_id,
-            share_headers,
+            share_header_batch_with_empty_branches(share_headers),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -808,6 +983,9 @@ mod tests {
             .expect_organise_header()
             .returning(|_| Ok(None));
         chain_store_handle
+            .expect_add_header_template_merkle_branches()
+            .returning(|_| Ok(()));
+        chain_store_handle
             .expect_find_fork_point_height()
             .returning(|_| Ok(Some(0)));
 
@@ -826,12 +1004,15 @@ mod tests {
 
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
+        mock_validator
+            .expect_validate_uncles()
+            .returning(|_, _| Ok(()));
 
         let share_headers = vec![build_valid_test_header()];
 
         let result = handle_share_headers(
             peer_id,
-            share_headers,
+            share_header_batch_with_empty_branches(share_headers),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -878,7 +1059,7 @@ mod tests {
 
         let result = handle_share_headers(
             peer_id,
-            share_headers,
+            share_header_batch_with_empty_branches(share_headers),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -908,7 +1089,11 @@ mod tests {
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
 
-        let result = validate_header_chain(&[child], &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(vec![child.clone()]),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -934,7 +1119,11 @@ mod tests {
         setup_minimum_difficulty_mock(&mut mock_validator);
 
         let headers = vec![share_a, share_b];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -970,8 +1159,94 @@ mod tests {
 
         // Order: share_a, uncle, share_b (as get_descendant_blockhashes produces)
         let headers = vec![share_a, uncle, share_b];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
+    }
+
+    /// Headers are organised in batch order, and organising a nephew reads its
+    /// uncles' headers to add their work, so an uncle delivered after its
+    /// nephew is treated as missing.
+    #[test]
+    fn test_validate_header_chain_rejects_uncle_after_nephew() {
+        let anchor = TestShareBlockBuilder::new().nonce(1).build();
+        let anchor_hash = anchor.block_hash();
+        let mut share_a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(anchor_hash.to_string())
+            .nonce(2)
+            .build()
+            .header;
+        share_a.bits = CompactTarget::from_consensus(MAX_POOL_TARGET);
+        // uncle is a sibling of share_a (same parent = anchor)
+        let mut uncle = TestShareBlockBuilder::new()
+            .prev_share_blockhash(anchor_hash.to_string())
+            .nonce(3)
+            .build()
+            .header;
+        uncle.bits = CompactTarget::from_consensus(MAX_POOL_TARGET);
+        let mut share_b = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share_a.block_hash().to_string())
+            .uncles(vec![uncle.block_hash()])
+            .nonce(4)
+            .build()
+            .header;
+        share_b.bits = CompactTarget::from_consensus(MAX_POOL_TARGET);
+
+        // Only the anchor is in the store.
+        let mut chain_store_handle = ChainStoreHandle::default();
+        let template_header = build_valid_test_header();
+        let genesis_header = template_header.clone();
+        chain_store_handle
+            .expect_get_genesis_header()
+            .returning(move || Ok(genesis_header.clone()));
+        chain_store_handle
+            .expect_get_share_header()
+            .returning(move |_| Ok(template_header.clone()));
+        let anchor_metadata = BlockMetadata {
+            expected_height: Some(0),
+            chain_work: Work::from_hex("0x00").unwrap(),
+            status: Status::BlockValid,
+            chain: ChainMembership::Confirmed,
+        };
+        let single_metadata = anchor_metadata.clone();
+        chain_store_handle
+            .expect_get_block_metadata()
+            .returning(move |hash| {
+                if *hash == anchor_hash {
+                    Ok(single_metadata.clone())
+                } else {
+                    Err(StoreError::NotFound(format!("{hash} not found")))
+                }
+            });
+        chain_store_handle
+            .expect_get_block_metadata_batch()
+            .returning(move |hashes| {
+                Ok(hashes
+                    .iter()
+                    .filter(|hash| **hash == anchor_hash)
+                    .map(|hash| (*hash, anchor_metadata.clone()))
+                    .collect())
+            });
+        let mut mock_validator = MockDefaultShareValidator::default();
+        setup_minimum_difficulty_mock(&mut mock_validator);
+
+        // Order: share_a, share_b, uncle -- the uncle arrives after its nephew.
+        let headers = vec![share_a, share_b, uncle];
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not delivered in batch and not in store"),
+        );
     }
 
     #[test]
@@ -991,11 +1266,15 @@ mod tests {
             .returning(|_| Err(StoreError::NotFound("not found".into())));
         chain_store_handle
             .expect_get_block_metadata_batch()
-            .returning(|_| Vec::new());
+            .returning(|_| Ok(Vec::new()));
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
 
-        let result = validate_header_chain(&[child], &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(vec![child.clone()]),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -1034,7 +1313,8 @@ mod tests {
                     Ok(BlockMetadata {
                         expected_height: Some(0),
                         chain_work: Work::from_hex("0x00").unwrap(),
-                        status: Status::Confirmed,
+                        status: Status::BlockValid,
+                        chain: ChainMembership::Confirmed,
                     })
                 } else {
                     Err(StoreError::NotFound(format!("{hash} not found")))
@@ -1043,7 +1323,7 @@ mod tests {
         chain_store_handle
             .expect_get_block_metadata_batch()
             .returning(move |hashes| {
-                hashes
+                Ok(hashes
                     .iter()
                     .filter(|hash| **hash == anchor_hash)
                     .map(|hash| {
@@ -1052,11 +1332,12 @@ mod tests {
                             BlockMetadata {
                                 expected_height: Some(0),
                                 chain_work: Work::from_hex("0x00").unwrap(),
-                                status: Status::Confirmed,
+                                status: Status::BlockValid,
+                                chain: ChainMembership::Confirmed,
                             },
                         )
                     })
-                    .collect()
+                    .collect())
             });
         let template_header = build_valid_test_header();
         chain_store_handle
@@ -1066,7 +1347,11 @@ mod tests {
         setup_minimum_difficulty_mock(&mut mock_validator);
 
         let headers = vec![share_a, share_c];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -1114,7 +1399,11 @@ mod tests {
         setup_minimum_difficulty_mock(&mut mock_validator);
 
         let headers = vec![share_a, share_b, share_c, share_d];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -1155,7 +1444,11 @@ mod tests {
         setup_minimum_difficulty_mock(&mut mock_validator);
 
         let headers = vec![share_a, share_b, uncle, share_c];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -1226,7 +1519,11 @@ mod tests {
         let headers = vec![
             share_b, share_c, share_d, share_e, share_f, share_g, share_h,
         ];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -1299,7 +1596,11 @@ mod tests {
 
         // Batch order: A, fork_parent, B, U, C
         let headers = vec![share_a, fork_parent, share_b, uncle_u, share_c];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -1345,7 +1646,8 @@ mod tests {
                     Ok(BlockMetadata {
                         expected_height: Some(0),
                         chain_work: Work::from_hex("0x00").unwrap(),
-                        status: Status::Confirmed,
+                        status: Status::BlockValid,
+                        chain: ChainMembership::Confirmed,
                     })
                 } else {
                     Err(StoreError::NotFound(format!("{hash} not found")))
@@ -1354,7 +1656,7 @@ mod tests {
         chain_store_handle
             .expect_get_block_metadata_batch()
             .returning(move |hashes| {
-                hashes
+                Ok(hashes
                     .iter()
                     .filter(|hash| **hash == anchor_a_hash || **hash == anchor_b_hash)
                     .map(|hash| {
@@ -1363,17 +1665,22 @@ mod tests {
                             BlockMetadata {
                                 expected_height: Some(0),
                                 chain_work: Work::from_hex("0x00").unwrap(),
-                                status: Status::Confirmed,
+                                status: Status::BlockValid,
+                                chain: ChainMembership::Confirmed,
                             },
                         )
                     })
-                    .collect()
+                    .collect())
             });
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
 
         let headers = vec![share_a, share_b];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_ok(), "Expected Ok, got: {}", result.unwrap_err());
     }
 
@@ -1447,10 +1754,11 @@ mod tests {
         // External parent not found in store
         chain_store_handle
             .expect_get_block_metadata_batch()
-            .returning(|_| Vec::new());
-        // get_tip_height for computing retry depth
+            .returning(|_| Ok(Vec::new()));
+        // candidate tip height for computing retry depth, matching the base
+        // build_locator subtracts the depth from
         chain_store_handle
-            .expect_get_tip_height()
+            .expect_get_candidate_tip_height()
             .returning(|| Ok(Some(100)));
         // build_locator for the retry getheaders
         chain_store_handle
@@ -1465,7 +1773,7 @@ mod tests {
 
         let result = handle_share_headers(
             peer_id,
-            vec![share],
+            share_header_batch_with_empty_branches(vec![share]),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -1507,7 +1815,7 @@ mod tests {
 
         let result = handle_share_headers(
             peer_id,
-            share_headers,
+            share_header_batch_with_empty_branches(share_headers),
             chain_store_handle,
             swarm_tx,
             block_fetcher_handle,
@@ -1546,7 +1854,7 @@ mod tests {
         chain_store_handle
             .expect_get_block_metadata_batch()
             .returning(move |hashes| {
-                hashes
+                Ok(hashes
                     .iter()
                     .filter(|hash| **hash == known_anchor_hash)
                     .map(|hash| {
@@ -1555,17 +1863,22 @@ mod tests {
                             BlockMetadata {
                                 expected_height: Some(0),
                                 chain_work: Work::from_hex("0x00").unwrap(),
-                                status: Status::Confirmed,
+                                status: Status::BlockValid,
+                                chain: ChainMembership::Confirmed,
                             },
                         )
                     })
-                    .collect()
+                    .collect())
             });
         let mut mock_validator = MockDefaultShareValidator::default();
         setup_minimum_difficulty_mock(&mut mock_validator);
 
         let headers = vec![share_a, share_b];
-        let result = validate_header_chain(&headers, &chain_store_handle, &mock_validator);
+        let result = validate_header_chain(
+            &share_header_batch_with_empty_branches(headers),
+            &chain_store_handle,
+            &mock_validator,
+        );
         assert!(result.is_err());
         assert!(
             result

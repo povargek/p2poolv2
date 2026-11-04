@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Chain store handle providing chain-level operations with serialized writes.
 //!
@@ -20,15 +8,20 @@
 //! height calculation, chain work tracking, and reorg handling. Read operations
 //! are synchronous and direct, while writes are serialized through the store writer.
 
+use crate::accounting::payout::sharechain_pplns::pplns_window::PRUNE_INTERVAL;
 use crate::accounting::payout::simple_pplns::SimplePplnsShare;
+use crate::config::PoolMode;
 use crate::shares::share_block::{ShareBlock, ShareHeader};
 use crate::store::block_tx_metadata::{BlockMetadata, Status};
-use crate::store::dag_store::{ShareDag, UncleInfo};
+use crate::store::dag_store::{BlockValidSearch, ShareDag, UncleInfo};
+use crate::store::found_block::FoundBlock;
+use crate::store::prune_blocks::{PruneStats, get_range_to_prune};
+use crate::store::transaction_store::{OutputOrigin, PrevoutCheck};
 use crate::store::writer::{StoreError, StoreHandle};
-use bitcoin::{BlockHash, Work};
-use std::collections::{HashMap, HashSet};
+use bitcoin::{BlockHash, TxMerkleNode, Work};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A confirmed header with its height, blockhash, and share header.
 #[derive(Clone, Debug)]
@@ -45,6 +38,14 @@ pub(crate) const COMMON_ANCESTOR_DEPTH: usize = 2160; // 6 shares per minute * 6
 /// Maximum age in seconds for the confirmed chain tip to be considered
 /// current. Used to suppress block fetching during initial header sync.
 const MAX_TIP_AGE_SECS: u64 = 300;
+
+/// True when a tip stamped `tip_time` is recent enough relative to `now_secs`.
+///
+/// Split out of `is_current` so the boundary is decidable without reading a
+/// clock: `is_current` fetches the tip and the time, this decides.
+fn is_tip_current(tip_time: u32, now_secs: u64) -> bool {
+    now_secs.saturating_sub(tip_time as u64) <= MAX_TIP_AGE_SECS
+}
 
 /// Handle for chain-level store operations.
 ///
@@ -71,21 +72,77 @@ impl ChainStoreHandle {
     /// Initialise the chain from an existing store or set up genesis.
     ///
     /// If genesis is already in store, initialises chain state from existing data.
-    /// Otherwise, adds genesis block to create a new chain.
+    /// If the store is empty, adds genesis block to create a new chain.
+    ///
+    /// Returns `StoreError::GenesisMismatch` when the store holds a share
+    /// chain that started from a different genesis. The store must be
+    /// deleted before the node can join the new chain: continuing would
+    /// leave both chains in one database, and the old chain usually carries
+    /// more work, so this node would serve it to peers on the new chain.
     pub async fn init_or_setup_genesis(&self, genesis_block: ShareBlock) -> Result<(), StoreError> {
         let genesis_block_hash = genesis_block.header.block_hash();
-        let genesis_in_store = self.store_handle.get_share(&genesis_block_hash);
 
-        if genesis_in_store.is_none() {
-            // Set up new chain with genesis
-            self.add_share_block(genesis_block).await?;
-        } else {
-            // Initialise chain state from existing store data
-            self.store_handle
+        // Read header as it is never pruned out
+        if self
+            .store_handle
+            .get_share_header(&genesis_block_hash)?
+            .is_some()
+        {
+            return self
+                .store_handle
                 .init_chain_state_from_store(genesis_block_hash)
-                .await?;
+                .await;
         }
-        Ok(())
+
+        //* Our genesis is absent, so the store is either empty or built on
+        //* another share chain. `setup_genesis` confirms genesis at height
+        //* 0, so the confirmed block there is the store's own genesis and
+        //* tells the two cases apart.
+        match self.get_confirmed_at_height(0) {
+            Ok(stored_genesis) => Err(StoreError::GenesisMismatch(format!(
+                "store was built on share chain genesis {stored_genesis}, but this node \
+                 is built for genesis {genesis_block_hash}. Delete the store directory \
+                 to join this chain."
+            ))),
+            Err(StoreError::NotFound(_)) => self.add_share_block(genesis_block).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Initialise the chain for the node's pool mode.
+    ///
+    /// P2Poolv2 mode uses `init_or_setup_genesis`, failing with
+    /// `StoreError::GenesisMismatch` on a store built on another share
+    /// chain. Hydrapool mode keeps no share chain beyond genesis, so a
+    /// genesis change between releases must not stop the pool from
+    /// upgrading: it uses `init_or_replace_genesis` instead.
+    pub async fn init_for_mode(
+        &self,
+        genesis_block: ShareBlock,
+        mode: PoolMode,
+    ) -> Result<(), StoreError> {
+        match mode {
+            PoolMode::Hydrapool => self.init_or_replace_genesis(genesis_block).await,
+            PoolMode::P2poolv2 => self.init_or_setup_genesis(genesis_block).await,
+        }
+    }
+
+    /// Initialise the chain like `init_or_setup_genesis`, but replace the
+    /// genesis of a store built on another share chain instead of failing.
+    ///
+    /// The replacement genesis is confirmed at height 0; the old genesis
+    /// stays in the store unreferenced by the confirmed chain.
+    async fn init_or_replace_genesis(&self, genesis_block: ShareBlock) -> Result<(), StoreError> {
+        match self.init_or_setup_genesis(genesis_block.clone()).await {
+            Err(StoreError::GenesisMismatch(reason)) => {
+                warn!(
+                    "Using share chain genesis {}: {reason}",
+                    genesis_block.block_hash()
+                );
+                self.store_handle.setup_genesis(genesis_block).await
+            }
+            result => result,
+        }
     }
 
     /// Get direct access to the underlying store handle.
@@ -110,41 +167,38 @@ impl ChainStoreHandle {
         self.store_handle.get_all_prevouts(transaction)
     }
 
-    /// Batch-read all outpoints from the Outputs CF.
-    /// Returns an error if any is missing, otherwise returns coinbase outpoints.
-    pub fn check_prevouts_and_find_coinbase(
+    /// Batch-read all outpoints from the Outputs CF and check every rule that
+    /// depends only on the spending block: the output exists, its coinbase root
+    /// is within the payout window, and a coinbase output is mature relative to
+    /// `spending_height`. A violation comes back as `PrevoutCheck::Rejected` so
+    /// the caller can treat it as a consensus violation; `Err` means the read
+    /// itself failed.
+    pub fn check_prevouts(
         &self,
         outpoints: &[bitcoin::OutPoint],
-    ) -> Result<Vec<bitcoin::OutPoint>, StoreError> {
-        self.store_handle
-            .check_prevouts_and_find_coinbase(outpoints)
+        spending_height: u32,
+        min_coinbase_root_height: u32,
+        coinbase_maturity: usize,
+    ) -> Result<PrevoutCheck, StoreError> {
+        self.store_handle.check_prevouts(
+            outpoints,
+            spending_height,
+            min_coinbase_root_height,
+            coinbase_maturity,
+        )
     }
 
-    /// Return the first coinbase outpoint that is not yet mature, or None.
-    /// Fetches the current tip height internally.
-    pub fn find_immature_coinbase_prevout(
+    /// Return true when every listed block, and every uncle it references,
+    /// either has its block body stored or sits below `prune_height`, where
+    /// bodies are never fetched. Errors when a block has no metadata or no
+    /// expected height.
+    pub fn all_block_and_uncle_data_available(
         &self,
-        coinbase_outpoints: &[bitcoin::OutPoint],
-        min_depth: usize,
-    ) -> Result<Option<bitcoin::OutPoint>, StoreError> {
-        let tip_height = self.get_tip_height()?.ok_or_else(|| {
-            StoreError::NotFound("No tip height available for maturity check".to_string())
-        })?;
-        self.store_handle
-            .find_immature_coinbase_prevout(coinbase_outpoints, min_depth, tip_height)
-    }
-
-    /// Batch check the SpendsIndex CF: true if any outpoint is already spent.
-    pub fn is_any_prevout_spent(
-        &self,
-        outpoints: &[bitcoin::OutPoint],
+        blockhashes: &[BlockHash],
+        prune_height: u32,
     ) -> Result<bool, StoreError> {
-        self.store_handle.is_any_prevout_spent(outpoints)
-    }
-
-    /// Returns true if every txid is on the confirmed sharechain.
-    pub fn are_all_txids_confirmed(&self, txids: &[bitcoin::Txid]) -> Result<bool, StoreError> {
-        self.store_handle.are_all_txids_confirmed(txids)
+        self.store_handle
+            .all_block_and_uncle_data_available(blockhashes, prune_height)
     }
 
     /// Retrieve a single transaction output by txid and output index.
@@ -154,6 +208,25 @@ impl ChainStoreHandle {
         vout: u32,
     ) -> Result<bitcoin::TxOut, StoreError> {
         self.store_handle.get_output(txid, vout)
+    }
+
+    /// Get a transaction and each output's coinbase origin, in output
+    /// order. See `Store::get_tx_with_output_origins`.
+    pub fn get_tx_with_output_origins(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<(bitcoin::Transaction, Vec<OutputOrigin>), StoreError> {
+        self.store_handle.store().get_tx_with_output_origins(txid)
+    }
+
+    /// The confirmed block containing `txid`, with its height, or `None`
+    /// when no confirmed block contains it. See
+    /// `Store::get_confirmed_block_for_txid`.
+    pub fn get_confirmed_block_for_txid(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<(BlockHash, u32)>, StoreError> {
+        self.store_handle.store().get_confirmed_block_for_txid(txid)
     }
 
     /// Check whether a share block exists without deserializing it.
@@ -305,37 +378,37 @@ impl ChainStoreHandle {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let tip_time = tip_header.time as u64;
-        now_secs.saturating_sub(tip_time) <= MAX_TIP_AGE_SECS
+        is_tip_current(tip_header.time, now_secs)
     }
 
-    /// Get the confirmed tip height and parent time for ASERT target
+    /// Get the height and time of a specific share, for ASERT target
     /// calculation.
     ///
-    /// Reads the tip blockhash once and derives both height (from
-    /// block metadata) and time (from share header) from that same
-    /// hash. This avoids a race where the confirmed tip advances
-    /// between two independent store queries
+    /// Height comes from block metadata, time from the share header, both
+    /// keyed on the given `share_hash`. Callers building work pass the same
+    /// hash they declare as `prev_share_blockhash`, so the target (`bits`)
+    /// they compute is derived from that exact parent rather than a
+    /// separately re-read live tip that may have advanced in between.
     ///
-    /// Returns (tip_height, tip_time) where tip_time is the share
-    /// chain tip's timestamp (the parent time for the next share
-    /// being built).
-    pub fn get_tip_height_and_time(&self) -> Result<(u32, u32), StoreError> {
-        let tip_blockhash = self.store_handle.get_chain_tip()?;
-
-        let headers = self.get_share_headers(&[tip_blockhash])?;
-        let tip_header = headers
+    /// Returns (height, time) where time is the share's timestamp (the
+    /// parent time for the next share being built).
+    pub fn get_share_height_and_time(
+        &self,
+        share_hash: &BlockHash,
+    ) -> Result<(u32, u32), StoreError> {
+        let headers = self.get_share_headers(&[*share_hash])?;
+        let header = headers
             .into_iter()
             .next()
             .map(|(_, header)| header)
-            .ok_or_else(|| StoreError::NotFound("No header found for chain tip".into()))?;
+            .ok_or_else(|| StoreError::NotFound(format!("No header found for {share_hash}")))?;
 
-        let metadata = self.get_block_metadata(&tip_blockhash)?;
-        let tip_height = metadata
-            .expected_height
-            .ok_or_else(|| StoreError::NotFound("No height in tip metadata".into()))?;
+        let metadata = self.get_block_metadata(share_hash)?;
+        let height = metadata.expected_height.ok_or_else(|| {
+            StoreError::NotFound(format!("No height in metadata for {share_hash}"))
+        })?;
 
-        Ok((tip_height, tip_header.time))
+        Ok((height, header.time))
     }
 
     /// Get the genesis blockhash from the chain.
@@ -362,9 +435,24 @@ impl ChainStoreHandle {
         self.store_handle.get_total_work()
     }
 
+    /// Get every bitcoin block found by the pool, ordered by bitcoin height.
+    pub fn get_found_blocks(&self) -> Result<Vec<FoundBlock>, StoreError> {
+        self.store_handle.get_found_blocks()
+    }
+
     /// Get the confirmed blockhash at the height
     pub fn get_confirmed_at_height(&self, height: u32) -> Result<BlockHash, StoreError> {
         self.store_handle.get_confirmed_at_height(height)
+    }
+
+    /// Get the candidate-chain blockhash at the height.
+    ///
+    /// The candidate counterpart of `get_confirmed_at_height`. Note that
+    /// genesis is registered on the confirmed chain only, so height 0 is
+    /// `NotFound` here -- callers walking down to genesis must fall back to
+    /// the confirmed index.
+    pub fn get_candidate_at_height(&self, height: u32) -> Result<BlockHash, StoreError> {
+        self.store_handle.store().get_candidate_at_height(height)
     }
 
     /// Get blockhashes for a specific height.
@@ -452,35 +540,55 @@ impl ChainStoreHandle {
         })
     }
 
-    /// Build a locator for the chain using only confirmed chain blocks.
+    /// Build a locator for the chain from the candidate (header) chain.
     ///
     /// Returns blockhashes at exponentially spaced heights from the
-    /// starting height back to genesis. Only confirmed blocks are
-    /// included so that the peer can match against its own chain.
+    /// starting height back to genesis. The locator advertises what we
+    /// already hold so the peer can serve only the gap, and headers are what
+    /// getheaders fetches -- so it walks the candidate chain, which includes
+    /// every header we have, rather than the confirmed chain, which lags it by
+    /// however far bodies lag headers. Anchoring on the confirmed tip made a
+    /// restart re-request every header above it.
     ///
-    /// When depth is 0, starts from the confirmed tip (normal
-    /// behavior). When depth > 0, starts from confirmed_tip - depth,
-    /// providing a deeper locator to cover fork block parents that
-    /// the receiver may not have.
+    /// Each height falls back to the confirmed index when the candidate index
+    /// has no entry. That is required, not merely defensive: genesis is
+    /// registered on the confirmed chain only, and a candidate reorg can drop
+    /// entries. Without the fallback the locator could lose its genesis anchor,
+    /// match nothing at the peer, and be answered with genesis -- the very
+    /// full refetch this avoids.
+    ///
+    /// Responders accept this: `first_known_for_locator` matches any block that
+    /// is not Pending or Invalid, HeaderValid included.
+    ///
+    /// When depth is 0, starts from the candidate tip (normal behavior). When
+    /// depth > 0, starts from candidate_tip - depth, providing a deeper locator
+    /// to cover fork block parents that the receiver may not have.
     pub fn build_locator(&self, depth: u32) -> Result<Vec<BlockHash>, StoreError> {
-        let tip_height = self.get_tip_height()?;
-        match tip_height {
-            Some(tip_height) => {
-                if tip_height == 0 {
-                    let Some(genesis) = self.get_genesis_blockhash() else {
-                        return Err(StoreError::NotFound(
-                            "No genesis found when building locator for empty chain".into(),
-                        ));
-                    };
-                    return Ok(vec![genesis]);
-                }
+        // Start from the highest block we hold. Normally that is the candidate
+        // tip, which covers every header we have. Take the higher of the two so
+        // the locator is never weaker than the confirmed chain alone would make
+        // it: a genesis-only store has no candidate entry at all, and a
+        // transient candidate/confirmed inconsistency must not lose the top.
+        let tip_height = match (self.get_candidate_tip_height()?, self.get_tip_height()?) {
+            (Some(candidate_height), Some(confirmed_height)) => {
+                Some(candidate_height.max(confirmed_height))
             }
-            None => {
-                return Ok(vec![]);
-            }
+            (candidate_height, confirmed_height) => candidate_height.or(confirmed_height),
+        };
+
+        let Some(tip_height) = tip_height else {
+            return Ok(vec![]);
+        };
+        if tip_height == 0 {
+            let Some(genesis) = self.get_genesis_blockhash() else {
+                return Err(StoreError::NotFound(
+                    "No genesis found when building locator for empty chain".into(),
+                ));
+            };
+            return Ok(vec![genesis]);
         }
 
-        let start_height = tip_height.unwrap().saturating_sub(depth);
+        let start_height = tip_height.saturating_sub(depth);
 
         let mut indexes = Vec::new();
         let mut step = 1;
@@ -498,29 +606,65 @@ impl ChainStoreHandle {
 
         let mut locator = Vec::with_capacity(indexes.len());
         for height in indexes {
-            if let Ok(confirmed_hash) = self.store_handle.get_confirmed_at_height(height) {
-                locator.push(confirmed_hash);
+            let blockhash = self
+                .get_candidate_at_height(height)
+                .or_else(|_| self.store_handle.get_confirmed_at_height(height));
+            if let Ok(blockhash) = blockhash {
+                locator.push(blockhash);
             }
         }
 
         Ok(locator)
     }
 
-    /// Get the chain tip and uncles from the confirmed chain.
+    /// The block to mine the next share on: the highest-work `BlockValid`
+    /// descendant of the confirmed tip, ties broken by the lexicographically
+    /// smallest hash, or the confirmed tip itself when nothing above it is
+    /// validated.
     ///
-    /// Delegates uncle selection to Store::find_uncles() and removes
-    /// the chain tip from the result to guarantee the parent is never
-    /// also listed as an uncle.
-    pub fn get_chain_tip_and_uncles(&self) -> Result<(BlockHash, HashSet<BlockHash>), StoreError> {
-        let chain_tip = self.get_chain_tip()?;
-        let uncles: HashSet<BlockHash> = self
-            .store_handle
-            .store()
-            .find_uncles()?
-            .into_iter()
-            .filter(|uncle| *uncle != chain_tip)
-            .collect();
-        Ok((chain_tip, uncles))
+    /// Mining on the highest-work validated block -- which may sit off the
+    /// candidate chain -- keeps honest miners building on validated work even
+    /// when an attacker's unvalidatable high-work chain stalls confirmation.
+    /// Each share then adds work to the validated branch, so once that branch
+    /// out-works the candidate tip, the candidate chain reorgs onto it and
+    /// confirmation follows.
+    pub fn get_mining_base(&self) -> Result<BlockHash, StoreError> {
+        let store = self.store_handle.store();
+        let top_confirmed = store.get_top_confirmed()?;
+        match store.find_best_block_valid_descendant(&top_confirmed.hash)? {
+            BlockValidSearch::Found(blockhash) => Ok(blockhash),
+            // Nothing above the confirmed tip: the ordinary state when
+            // confirmation is keeping up with what we have validated.
+            BlockValidSearch::NotFound { visited: 0 } => Ok(top_confirmed.hash),
+            BlockValidSearch::NotFound { visited } => {
+                warn!(
+                    "Mining on confirmed tip {}: none of the {visited} blocks above it is BlockValid",
+                    top_confirmed.hash
+                );
+                Ok(top_confirmed.hash)
+            }
+        }
+    }
+
+    /// The mining base and the uncles to reference when building on it.
+    ///
+    /// Uncles come from `find_uncles`, excluding the mining base and its
+    /// ancestry down to the confirmed chain, so a block we build on (or one
+    /// of its ancestors) is never also listed as an uncle.
+    ///
+    /// Connectivity to the confirmed chain is not checked, because it holds by
+    /// construction: `find_best_block_valid_descendant` seeds its walk from
+    /// `children_blockhashes(confirmed_tip)`, only enqueues children of blocks
+    /// it has visited, and filters every edge through `is_child_of`, so
+    /// anything it returns retraces to the confirmed tip through parent
+    /// pointers -- and each fallback returns the confirmed tip itself. A store
+    /// inconsistent enough to break that surfaces one step later regardless:
+    /// `get_distribution_from_start_hash` follows the same parent pointers to
+    /// build the payout and errors on a missing header.
+    pub fn get_mining_base_and_uncles(&self) -> Result<(BlockHash, Vec<BlockHash>), StoreError> {
+        let mining_base = self.get_mining_base()?;
+        let uncles = self.store_handle.store().find_uncles(&mining_base)?;
+        Ok((mining_base, uncles))
     }
 
     /// Check which blockhashes are missing from the chain.
@@ -550,16 +694,29 @@ impl ChainStoreHandle {
     /// Returns blockhashes on the candidate chain that do not yet have
     /// full block data (status is not BlockValid or Confirmed).
     ///
-    /// When `min_scan_height` is provided, the scan extends down to
+    /// When `fork_height` is provided, the scan extends down to
     /// that height so fork blocks at or below the confirmed tip are
     /// included.
     pub fn get_candidate_blocks_missing_data(
         &self,
-        min_scan_height: Option<u32>,
+        fork_height: Option<u32>,
     ) -> Result<Vec<BlockHash>, StoreError> {
         self.store_handle
             .store()
-            .get_candidate_blocks_missing_data(min_scan_height)
+            .get_candidate_blocks_missing_data(fork_height)
+    }
+
+    /// Returns candidate-chain blocks from `from_height` upward whose body is
+    /// stored but which are still only `HeaderValid` (stranded), at most
+    /// `limit`, height-ascending. See `Store::get_candidate_blocks_needing_validation`.
+    pub fn get_candidate_blocks_needing_validation(
+        &self,
+        from_height: u32,
+        limit: usize,
+    ) -> Result<Vec<BlockHash>, StoreError> {
+        self.store_handle
+            .store()
+            .get_candidate_blocks_needing_validation(from_height, limit)
     }
 
     /// Check if a blockhash has Candidate status in its metadata.
@@ -573,10 +730,13 @@ impl ChainStoreHandle {
     }
 
     /// Batch fetch metadata for multiple blockhashes in a single multi_get.
+    ///
+    /// Blockhashes with no metadata row are omitted; a failed read or an
+    /// undecodable row is an `Err`. See `Store::get_block_metadata_batch`.
     pub fn get_block_metadata_batch(
         &self,
         blockhashes: &[BlockHash],
-    ) -> Vec<(BlockHash, BlockMetadata)> {
+    ) -> Result<Vec<(BlockHash, BlockMetadata)>, StoreError> {
         self.store_handle
             .store()
             .get_block_metadata_batch(blockhashes)
@@ -593,6 +753,12 @@ impl ChainStoreHandle {
         self.get_block_metadata(hash)
             .map(|metadata| metadata.status == status)
             .unwrap_or(false)
+    }
+
+    /// Check whether a block is on the confirmed chain (position, not status).
+    /// Returns false if the block has no metadata in the store.
+    pub fn is_block_confirmed(&self, hash: &BlockHash) -> bool {
+        self.store_handle.store().is_confirmed(hash)
     }
 
     /// Get the depth of a blockhash from the confirmed chain tip.
@@ -638,23 +804,6 @@ impl ChainStoreHandle {
             None => Err(StoreError::NotFound("No tips found".into())),
             Some((_, header)) => Ok(header.bits.to_consensus()),
         }
-    }
-
-    /// Set up a share for the chain by setting prev_blockhash and uncles.
-    pub fn setup_share_for_chain(
-        &self,
-        mut share_block: ShareBlock,
-    ) -> Result<ShareBlock, StoreError> {
-        let (chain_tip, tips) = self.get_chain_tip_and_uncles()?;
-        debug!(
-            "Setting up share for share blockhash: {:?} with chain_tip: {:?} and tips: {:?}",
-            share_block.block_hash(),
-            chain_tip,
-            tips
-        );
-        share_block.header.prev_share_blockhash = chain_tip;
-        share_block.header.uncles = tips.into_iter().collect();
-        Ok(share_block)
     }
 
     // ========================================================================
@@ -707,13 +856,116 @@ impl ChainStoreHandle {
 
     /// Promote candidates to confirmed.
     /// Returns the confirmed chain height after organising, if changed.
-    /// Prefers the candidate chain order. Falls back to any child of
-    /// the confirmed tip with full block and uncle data when no
-    /// candidate blocks can be promoted.
+    /// Prefers the candidate chain order.
     pub async fn organise_block(&self) -> Result<Option<u32>, StoreError> {
         let height = self.store_handle.organise_block().await?;
         debug!("Organised block at confirmed height {height:?}");
         Ok(height)
+    }
+
+    /// Mark a block Invalid so it is never promoted to confirmed. Used
+    /// when chain-context validation fails.
+    pub async fn mark_invalid(&self, blockhash: BlockHash) -> Result<(), StoreError> {
+        self.store_handle.mark_invalid(blockhash).await
+    }
+
+    /// Mark a block BlockValid after it passes chain-context validation.
+    pub async fn mark_block_valid(&self, blockhash: BlockHash) -> Result<(), StoreError> {
+        self.store_handle.mark_block_valid(blockhash).await
+    }
+
+    /// Lowest height from which block bodies may still need pruning, below
+    /// `target`. See `Store::find_prune_start`.
+    pub fn find_prune_start(&self, target: u32) -> Result<u32, StoreError> {
+        self.store_handle.store().find_prune_start(target)
+    }
+
+    /// Delete the block bodies at heights `[from, target)`.
+    ///
+    /// Sends one writer command per `PRUNE_INTERVAL` heights, so other
+    /// writes interleave between chunks. The caller must only prune below
+    /// the confirmed tip, since the candidate index entries in the range are
+    /// deleted too.
+    pub async fn prune_block_bodies(
+        &self,
+        from: u32,
+        target: u32,
+    ) -> Result<PruneStats, StoreError> {
+        let mut stats = PruneStats::default();
+        let mut chunk_start = from;
+        while chunk_start < target {
+            let chunk_end = chunk_start
+                .saturating_add(PRUNE_INTERVAL as u32)
+                .min(target);
+            let chunk_stats = self
+                .store_handle
+                .prune_block_bodies_chunk(chunk_start, chunk_end)
+                .await?;
+            stats.add(chunk_stats);
+            chunk_start = chunk_end;
+        }
+        Ok(stats)
+    }
+
+    /// Prune block bodies below the prune target when due.
+    ///
+    /// `get_range_to_prune` decides whether a prunning run is due and
+    /// over which heights. Range can be up to `Store::prune_target`,
+    /// which follows the confirmed tip. Deletion never reaches
+    /// heights the confirmed chain has not got to, which is required
+    /// when deleting candidate index entries. Allowing runs only
+    /// while the node is current stops a stale or withheld chain from
+    /// pruning.
+    ///
+    /// `next_prune_start` holds where the previous run stopped. It starts empty
+    /// and is derived from the store on the first run, so nothing is persisted.
+    /// Space and tombstones are reclaimed by RocksDB's automatic compaction;
+    /// a manual compaction would block it and rewrite every body column
+    /// family, since their keys are hashes, not heights.
+    pub async fn prune_block_bodies_if_due(
+        &self,
+        next_prune_start: &mut Option<u32>,
+    ) -> Result<(), StoreError> {
+        let Some(range) = get_range_to_prune(
+            self.is_current(),
+            self.store_handle.store().prune_target()?,
+            *next_prune_start,
+            |prune_target| self.find_prune_start(prune_target),
+        )?
+        else {
+            return Ok(());
+        };
+
+        let stats = self.prune_block_bodies(range.start, range.end).await?;
+        *next_prune_start = Some(range.end);
+        info!(
+            "Pruned block bodies at heights {}..{}: {} blocks, {} transactions",
+            range.start, range.end, stats.blocks, stats.transactions
+        );
+
+        Ok(())
+    }
+
+    /// Store the coinbase merkle branches of a batch of synced headers, so
+    /// headers held without their bodies can be served on with their proofs.
+    pub async fn add_header_template_merkle_branches(
+        &self,
+        entries: Vec<(BlockHash, Vec<TxMerkleNode>)>,
+    ) -> Result<(), StoreError> {
+        self.store_handle
+            .add_header_template_merkle_branches(entries)
+            .await
+    }
+
+    /// The coinbase merkle branch stored for a share, empty when none is
+    /// stored.
+    pub fn get_template_merkle_branches(
+        &self,
+        blockhash: &BlockHash,
+    ) -> Result<Vec<TxMerkleNode>, StoreError> {
+        self.store_handle
+            .store()
+            .get_template_merkle_branches(blockhash)
     }
 
     /// Add a block to the candidate chain and promote candidates to confirmed.
@@ -725,11 +977,18 @@ impl ChainStoreHandle {
     /// wrote, and a plain WriteBatch is opaque to reads against the DB.
     /// A crash between the two commits leaves a lingering candidate which
     /// the next promote_block call will pick up.
+    ///
+    /// Returns the new chain height, which can be higher than the
+    /// height of the `header`
     pub async fn promote_block(&self, header: ShareHeader) -> Result<Option<u32>, StoreError> {
         let blockhash = header.block_hash();
+        let uncle_count = header.uncles.len();
         self.organise_header(header).await?;
         let height = self.organise_block().await?;
         info!("Promoted block {blockhash} to confirmed height {height:?}");
+        if uncle_count > 0 {
+            info!("Confirmed block {blockhash} references {uncle_count} uncle(s)");
+        }
         Ok(height)
     }
 
@@ -776,23 +1035,25 @@ mockall::mock! {
     pub ChainStoreHandle {
         pub fn is_candidate(&self, blockhash: &BlockHash) -> bool;
         pub fn get_block_metadata(&self, hash: &BlockHash) -> Result<BlockMetadata, StoreError>;
-        pub fn get_block_metadata_batch(&self, blockhashes: &[BlockHash]) -> Vec<(BlockHash, BlockMetadata)>;
+        pub fn get_block_metadata_batch(&self, blockhashes: &[BlockHash]) -> Result<Vec<(BlockHash, BlockMetadata)>, StoreError>;
         pub fn get_uncle_infos(&self, uncle_hashes: &[BlockHash]) -> Vec<UncleInfo>;
         pub fn has_status(&self, hash: &BlockHash, status: Status) -> bool;
+        pub fn is_block_confirmed(&self, hash: &BlockHash) -> bool;
         pub fn get_blockhashes_for_height(&self, height: u32) -> Vec<BlockHash>;
         pub fn network(&self) -> bitcoin::Network;
         pub fn get_all_prevouts(&self, transaction: &bitcoin::Transaction) -> Result<Vec<(usize, bitcoin::TxOut)>, StoreError>;
-        pub fn check_prevouts_and_find_coinbase(&self, outpoints: &[bitcoin::OutPoint]) -> Result<Vec<bitcoin::OutPoint>, StoreError>;
-        pub fn find_immature_coinbase_prevout(&self, coinbase_outpoints: &[bitcoin::OutPoint], min_depth: usize) -> Result<Option<bitcoin::OutPoint>, StoreError>;
-        pub fn is_any_prevout_spent(&self, outpoints: &[bitcoin::OutPoint]) -> Result<bool, StoreError>;
-        pub fn are_all_txids_confirmed(&self, txids: &[bitcoin::Txid]) -> Result<bool, StoreError>;
+        pub fn check_prevouts(&self, outpoints: &[bitcoin::OutPoint], spending_height: u32, min_coinbase_root_height: u32, coinbase_maturity: usize) -> Result<PrevoutCheck, StoreError>;
+        pub fn all_block_and_uncle_data_available(&self, blockhashes: &[BlockHash], prune_height: u32) -> Result<bool, StoreError>;
         pub fn get_output(&self, txid: &bitcoin::Txid, vout: u32) -> Result<bitcoin::TxOut, StoreError>;
+        pub fn get_tx_with_output_origins(&self, txid: &bitcoin::Txid) -> Result<(bitcoin::Transaction, Vec<OutputOrigin>), StoreError>;
+        pub fn get_confirmed_block_for_txid(&self, txid: &bitcoin::Txid) -> Result<Option<(BlockHash, u32)>, StoreError>;
         pub fn share_block_exists(&self, blockhash: &BlockHash) -> bool;
         pub fn first_existing_share_header(&self, blockhashes: &[BlockHash]) -> Option<BlockHash>;
         pub fn get_share(&self, share_hash: &BlockHash) -> Option<ShareBlock>;
         pub fn get_shares_at_height(&self, height: u32) -> Result<HashMap<BlockHash, ShareBlock>, StoreError>;
         pub fn get_share_headers(&self, share_hashes: &[BlockHash]) -> Result<Vec<(BlockHash, ShareHeader)>, StoreError>;
         pub fn get_share_header(&self, share_hash: &BlockHash) -> Result<ShareHeader, StoreError>;
+        pub fn get_found_blocks(&self) -> Result<Vec<FoundBlock>, StoreError>;
         pub fn get_headers_for_locator(&self, block_hashes: &[BlockHash], stop_block_hash: &BlockHash, limit: usize) -> Result<Vec<ShareHeader>, StoreError>;
         pub fn get_blockhashes_for_locator(&self, locator: &[BlockHash], stop_block_hash: &BlockHash, max_blockhashes: usize) -> Result<Vec<BlockHash>, StoreError>;
         pub fn get_tip_height(&self) -> Result<Option<u32>, StoreError>;
@@ -802,8 +1063,9 @@ mockall::mock! {
         pub fn get_chain_tip_header(&self) -> Result<ShareHeader, StoreError>;
         pub fn get_candidate_tip_header(&self) -> Result<ShareHeader, StoreError>;
         pub fn is_current(&self) -> bool;
-        pub fn get_chain_tip_and_uncles(&self) -> Result<(BlockHash, HashSet<BlockHash>), StoreError>;
-        pub fn get_tip_height_and_time(&self) -> Result<(u32, u32), StoreError>;
+        pub fn get_mining_base(&self) -> Result<BlockHash, StoreError>;
+        pub fn get_mining_base_and_uncles(&self) -> Result<(BlockHash, Vec<BlockHash>), StoreError>;
+        pub fn get_share_height_and_time(&self, share_hash: &BlockHash) -> Result<(u32, u32), StoreError>;
         pub fn get_genesis_blockhash(&self) -> Option<BlockHash>;
         pub fn get_genesis_header(&self) -> Result<ShareHeader, StoreError>;
         pub fn get_children_blockhashes(&self, blockhash: &BlockHash) -> Result<Option<Vec<BlockHash>>, StoreError>;
@@ -811,19 +1073,28 @@ mockall::mock! {
         pub fn get_confirmed_headers_in_range(&self, from_height: u32, to_height: u32) -> Result<Vec<ConfirmedHeaderResult>, StoreError>;
         pub fn get_share_dag(&self, from_height: u32, to_height: u32) -> Result<ShareDag, StoreError>;
         pub fn get_missing_blockhashes(&self, blockhashes: &[BlockHash]) -> Vec<BlockHash>;
-        pub fn get_candidate_blocks_missing_data(&self, min_scan_height: Option<u32>) -> Result<Vec<BlockHash>, StoreError>;
+        pub fn get_candidate_blocks_missing_data(&self, fork_height: Option<u32>) -> Result<Vec<BlockHash>, StoreError>;
+        pub fn get_candidate_blocks_needing_validation(&self, from_height: u32, limit: usize) -> Result<Vec<BlockHash>, StoreError>;
+        pub fn get_candidate_at_height(&self, height: u32) -> Result<BlockHash, StoreError>;
         pub fn find_fork_point_height(&self, blockhash: &BlockHash) -> Result<Option<u32>, StoreError>;
         pub fn get_depth(&self, blockhash: &BlockHash) -> Option<usize>;
         pub fn get_pplns_shares_filtered(&self, limit: Option<usize>, start_time: Option<u64>, end_time: Option<u64>) -> Vec<SimplePplnsShare>;
         pub fn get_confirmed_at_height(&self, height: u32) -> Result<BlockHash, StoreError>;
         pub fn get_current_target(&self) -> Result<u32, StoreError>;
-        pub fn setup_share_for_chain(&self, share_block: ShareBlock) -> Result<ShareBlock, StoreError>;
         pub fn is_confirmed(&self, share: &ShareBlock) -> bool;
         pub fn is_confirmed_or_confirmed_uncle(&self, blockhash: &BlockHash) -> bool;
         pub fn get_btcaddresses_for_user_ids(&self, user_ids: &[u64]) -> Result<Vec<(u64, String)>, StoreError>;
         pub async fn init_or_setup_genesis(&self, genesis_block: ShareBlock) -> Result<(), StoreError>;
+        pub async fn init_for_mode(&self, genesis_block: ShareBlock, mode: PoolMode) -> Result<(), StoreError>;
         pub async fn organise_header(&self, header: ShareHeader) -> Result<Option<u32>, StoreError>;
         pub async fn organise_block(&self) -> Result<Option<u32>, StoreError>;
+        pub async fn mark_invalid(&self, blockhash: BlockHash) -> Result<(), StoreError>;
+        pub async fn mark_block_valid(&self, blockhash: BlockHash) -> Result<(), StoreError>;
+        pub fn find_prune_start(&self, target: u32) -> Result<u32, StoreError>;
+        pub async fn prune_block_bodies(&self, from: u32, target: u32) -> Result<PruneStats, StoreError>;
+        pub async fn prune_block_bodies_if_due(&self, next_prune_start: &mut Option<u32>) -> Result<(), StoreError>;
+        pub async fn add_header_template_merkle_branches(&self, entries: Vec<(BlockHash, Vec<TxMerkleNode>)>) -> Result<(), StoreError>;
+        pub fn get_template_merkle_branches(&self, blockhash: &BlockHash) -> Result<Vec<TxMerkleNode>, StoreError>;
         pub async fn promote_block(&self, header: ShareHeader) -> Result<Option<u32>, StoreError>;
         pub async fn add_share_block(&self, share: ShareBlock) -> Result<(), StoreError>;
         pub async fn add_share_block_and_organise_header(&self, share: ShareBlock) -> Result<Option<u32>, StoreError>;
@@ -838,16 +1109,403 @@ mockall::mock! {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::PoolMode;
+    use crate::store::Store;
+    use crate::store::writer::StoreError;
     use crate::test_utils::{
-        TestShareBlockBuilder, genesis_for_tests, setup_test_chain_store_handle,
+        TestShareBlockBuilder, build_confirmed_test_chain, genesis_for_tests,
+        setup_test_chain_store_handle, test_funding_transaction,
     };
     use bitcoin::BlockHash;
     use bitcoin::hashes::Hash;
+
+    /// A store already holding another share chain must be rejected, not
+    /// quietly given a second genesis. This is the stale-store case an
+    /// operator hits by upgrading across a chain reset without deleting the
+    /// store directory.
+    ///
+    /// The restart is simulated by calling init again with a different
+    /// genesis: the in-memory genesis blockhash a real restart clears does
+    /// not gate this path, so the branch taken is the same one.
+    #[tokio::test]
+    async fn test_init_or_setup_genesis_rejects_store_built_on_another_chain() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let other_genesis = TestShareBlockBuilder::new().nonce(0xe9695792).build();
+        assert_ne!(other_genesis.block_hash(), genesis.block_hash());
+
+        let error = chain_handle
+            .init_or_setup_genesis(other_genesis)
+            .await
+            .expect_err("store on another chain must be rejected");
+
+        assert!(
+            matches!(error, StoreError::GenesisMismatch(_)),
+            "expected GenesisMismatch, got {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&genesis.block_hash().to_string()),
+            "error must name the genesis already in the store: {error}"
+        );
+    }
+
+    /// Hydrapool must start on a store built on another share chain, so an
+    /// upgrade across a genesis change does not stop the pool. The code's
+    /// genesis replaces the stored one as the confirmed tip at height 0.
+    #[tokio::test]
+    async fn test_init_for_mode_hydrapool_replaces_genesis_of_another_chain() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let other_genesis = TestShareBlockBuilder::new().nonce(0xe9695792).build();
+        assert_ne!(other_genesis.block_hash(), genesis.block_hash());
+
+        chain_handle
+            .init_for_mode(other_genesis.clone(), PoolMode::Hydrapool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chain_handle.get_confirmed_at_height(0).unwrap(),
+            other_genesis.block_hash()
+        );
+        assert_eq!(
+            chain_handle.get_chain_tip().unwrap(),
+            other_genesis.block_hash()
+        );
+        assert_eq!(chain_handle.get_tip_height().unwrap(), Some(0));
+    }
+
+    /// In Hydrapool mode, a store already on the code's genesis is
+    /// initialised from the store, leaving the confirmed chain as it was.
+    #[tokio::test]
+    async fn test_init_for_mode_hydrapool_keeps_matching_genesis() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        chain_handle
+            .init_for_mode(genesis.clone(), PoolMode::Hydrapool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chain_handle.get_confirmed_at_height(0).unwrap(),
+            genesis.block_hash()
+        );
+        assert_eq!(chain_handle.get_chain_tip().unwrap(), genesis.block_hash());
+    }
+
+    /// P2Poolv2 mode must keep rejecting a store built on another share
+    /// chain, since it would serve the old chain to peers on the new one.
+    #[tokio::test]
+    async fn test_init_for_mode_p2poolv2_rejects_store_built_on_another_chain() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let other_genesis = TestShareBlockBuilder::new().nonce(0xe9695792).build();
+        assert_ne!(other_genesis.block_hash(), genesis.block_hash());
+
+        let error = chain_handle
+            .init_for_mode(other_genesis, PoolMode::P2poolv2)
+            .await
+            .expect_err("store on another chain must be rejected");
+
+        assert!(
+            matches!(error, StoreError::GenesisMismatch(_)),
+            "expected GenesisMismatch, got {error:?}"
+        );
+        assert_eq!(
+            chain_handle.get_confirmed_at_height(0).unwrap(),
+            genesis.block_hash()
+        );
+    }
 
     #[tokio::test]
     async fn test_chain_store_handle_creation() {
         let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
         assert_eq!(chain_handle.network(), bitcoin::Network::Signet);
+    }
+
+    #[tokio::test]
+    async fn test_get_mining_base_defaults_to_confirmed_tip() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        // No BlockValid block yet -> mining base is the confirmed (genesis) tip.
+        assert_eq!(
+            chain_handle.get_mining_base().unwrap(),
+            genesis.block_hash()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_mining_base_prefers_higher_work_block_valid() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        // A real block validated on top of genesis out-works the confirmed
+        // (genesis) tip, so it becomes the mining base.
+        let store = chain_handle.store_handle().store();
+        let block = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .work(2)
+            .build();
+        store.store_with_valid_metadata(&block);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&block.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(chain_handle.get_mining_base().unwrap(), block.block_hash());
+    }
+
+    /// A validated block that forks off below the confirmed tip is never the
+    /// mining base, however much work it carries: the base must descend from
+    /// the confirmed tip. Adopting a heavier branch is `reorg_confirmed`'s job,
+    /// not the mining base's.
+    #[tokio::test]
+    async fn test_get_mining_base_ignores_validated_sibling_of_confirmed_tip() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let store = chain_handle.store_handle().store();
+        let confirmed = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .work(2)
+            .build();
+        store.push_to_confirmed_chain(&confirmed).unwrap();
+
+        // A validated sibling of the confirmed tip, with far more work.
+        let sibling = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695799)
+            .work(8)
+            .build();
+        store.store_with_valid_metadata(&sibling);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&sibling.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            chain_handle.get_mining_base().unwrap(),
+            confirmed.block_hash(),
+            "a sibling of the confirmed tip is not a descendant of it"
+        );
+    }
+
+    /// Two validated descendants of the confirmed tip with equal cumulative
+    /// work: the lexicographically smaller hash wins, so every node picks the
+    /// same base.
+    #[tokio::test]
+    async fn test_get_mining_base_tiebreak_smallest_hash_on_equal_work() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let store = chain_handle.store_handle().store();
+        // Both build on the confirmed (genesis) tip with the same work, so
+        // they tie on cumulative work.
+        let child_a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .work(3)
+            .build();
+        let child_b = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695793)
+            .work(3)
+            .build();
+        store.store_with_valid_metadata(&child_a);
+        store.store_with_valid_metadata(&child_b);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&child_a.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .mark_block_valid(&child_b.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let expected = std::cmp::min(child_a.block_hash(), child_b.block_hash());
+        let other = std::cmp::max(child_a.block_hash(), child_b.block_hash());
+        assert_ne!(expected, other, "fixture must produce two distinct hashes");
+        assert_eq!(chain_handle.get_mining_base().unwrap(), expected);
+    }
+
+    /// Blocks sit above the confirmed tip but none is validated yet -- the
+    /// state header sync leaves behind. The base is the confirmed tip, and
+    /// get_mining_base warns because confirmation is not keeping up.
+    #[tokio::test]
+    async fn test_get_mining_base_returns_confirmed_tip_when_nothing_above_is_validated() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let store = chain_handle.store_handle().store();
+        // Header-only, as header sync stores it: metadata but no BlockValid.
+        let header_only = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .work(5)
+            .build();
+        store.create_valid_metadata_only(&header_only);
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_index(&genesis.block_hash(), &header_only.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            chain_handle.get_mining_base().unwrap(),
+            genesis.block_hash()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_mining_base_and_uncles_excludes_base() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        // With only genesis, the mining base is genesis and it is never
+        // listed as an uncle (its own-ancestry is excluded).
+        let (base, uncles) = chain_handle.get_mining_base_and_uncles().unwrap();
+        assert_eq!(base, genesis.block_hash());
+        assert!(!uncles.contains(&genesis.block_hash()));
+        assert!(uncles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_mining_base_and_uncles_returns_sibling_uncle() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let store = chain_handle.store_handle().store();
+        // Confirm a block at height 1.
+        let confirmed = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .work(2)
+            .build();
+        store.push_to_confirmed_chain(&confirmed).unwrap();
+
+        // A sibling of the confirmed block (also a child of genesis) with its
+        // body stored is a valid uncle candidate.
+        let sibling = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695793)
+            .work(1)
+            .build();
+        store.store_with_valid_metadata(&sibling);
+
+        // With no BlockValid block, the mining base is the confirmed tip. The
+        // sibling is returned as an uncle, and the mining base is never listed
+        // among the uncles.
+        let (base, uncles) = chain_handle.get_mining_base_and_uncles().unwrap();
+        assert_eq!(base, confirmed.block_hash());
+        assert!(uncles.contains(&sibling.block_hash()));
+        assert!(!uncles.contains(&confirmed.block_hash()));
+    }
+
+    #[tokio::test]
+    async fn test_get_mining_base_and_uncles_excludes_fork_ancestry() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let store = chain_handle.store_handle().store();
+        // Confirm a block at height 1.
+        let confirmed = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .work(2)
+            .build();
+        store.push_to_confirmed_chain(&confirmed).unwrap();
+
+        // A BlockValid block above the confirmed tip, off the candidate chain,
+        // becomes the mining base.
+        let fork = TestShareBlockBuilder::new()
+            .prev_share_blockhash(confirmed.block_hash().to_string())
+            .nonce(0xe9695793)
+            .work(5)
+            .build();
+        store.store_with_valid_metadata(&fork);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&fork.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // Another sibling off genesis is a genuine uncle, outside the fork's
+        // ancestry.
+        let sibling = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695794)
+            .work(1)
+            .build();
+        store.store_with_valid_metadata(&sibling);
+
+        let (base, uncles) = chain_handle.get_mining_base_and_uncles().unwrap();
+        // The mining base is the validated block above the confirmed tip; it
+        // and its ancestry (down to genesis) are excluded from the uncle set.
+        assert_eq!(base, fork.block_hash());
+        assert!(!uncles.contains(&fork.block_hash()));
+        assert!(!uncles.contains(&genesis.block_hash()));
+        // The confirmed tip is never an uncle, but the unrelated sibling is.
+        assert!(!uncles.contains(&confirmed.block_hash()));
+        assert!(uncles.contains(&sibling.block_hash()));
     }
 
     #[tokio::test]
@@ -943,6 +1601,10 @@ mod tests {
                 .organise_header(share.header.clone())
                 .await
                 .unwrap();
+            chain_handle
+                .mark_block_valid(share.block_hash())
+                .await
+                .unwrap();
             chain_handle.organise_block().await.unwrap();
             prev_hash = share.block_hash();
             shares.push(share);
@@ -973,9 +1635,7 @@ mod tests {
             assert_eq!(
                 confirmed,
                 share.block_hash(),
-                "Confirmed at height {} should match share {}",
-                height,
-                index
+                "Confirmed at height {height} should match share {index}"
             );
         }
 
@@ -1008,6 +1668,10 @@ mod tests {
             chain_handle.add_share_block(share.clone()).await.unwrap();
             chain_handle
                 .organise_header(share.header.clone())
+                .await
+                .unwrap();
+            chain_handle
+                .mark_block_valid(share.block_hash())
                 .await
                 .unwrap();
             chain_handle.organise_block().await.unwrap();
@@ -1045,7 +1709,10 @@ mod tests {
             .work(1)
             .build();
 
-        chain_handle.add_share_block(share1.clone()).await.unwrap();
+        chain_handle
+            .add_share_block_and_organise_header(share1.clone())
+            .await
+            .unwrap();
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
@@ -1053,7 +1720,10 @@ mod tests {
             .work(1)
             .build();
 
-        chain_handle.add_share_block(share2).await.unwrap();
+        chain_handle
+            .add_share_block_and_organise_header(share2)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1077,6 +1747,10 @@ mod tests {
             chain_handle.add_share_block(share.clone()).await.unwrap();
             chain_handle
                 .organise_header(share.header.clone())
+                .await
+                .unwrap();
+            chain_handle
+                .mark_block_valid(share.block_hash())
                 .await
                 .unwrap();
             chain_handle.organise_block().await.unwrap();
@@ -1153,29 +1827,36 @@ mod tests {
         assert!(!chain_handle.is_current());
     }
 
-    #[tokio::test]
-    async fn test_is_current_returns_true_at_boundary() {
-        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+    /// The age rule is decided by `is_tip_current`, which `is_current` calls
+    /// after reading the tip and the clock. Driving it directly pins both
+    /// sides of the boundary and cannot race the clock -- the previous version
+    /// read `SystemTime::now()` once to build the tip and again inside
+    /// `is_current`, so a one-second tick between them flipped the result.
+    #[test]
+    fn test_is_tip_current_at_boundary() {
+        let now_secs = 1_000_000u64;
+        let max_age = super::MAX_TIP_AGE_SECS;
 
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
-        // Set the tip timestamp exactly at the MAX_TIP_AGE_SECS boundary
-        let boundary_time = now_secs.saturating_sub(super::MAX_TIP_AGE_SECS as u32);
-
-        let genesis = TestShareBlockBuilder::new().time(boundary_time).build();
-
-        chain_handle.init_or_setup_genesis(genesis).await.unwrap();
-
-        assert!(chain_handle.is_current());
+        assert!(
+            super::is_tip_current((now_secs - max_age) as u32, now_secs),
+            "a tip exactly MAX_TIP_AGE_SECS old is still current"
+        );
+        assert!(
+            !super::is_tip_current((now_secs - max_age - 1) as u32, now_secs),
+            "one second past the boundary is stale"
+        );
+        assert!(
+            super::is_tip_current(now_secs as u32, now_secs),
+            "a tip stamped now is current"
+        );
     }
 
-    /// When a non-confirmed block (uncle) exists at the same height as
-    /// a confirmed block, the locator must only contain the confirmed
-    /// block.
+    /// When an off-chain block (uncle) exists at the same height as a
+    /// chain block, the locator must contain only the chain block. The
+    /// locator walks the candidate chain, which has one entry per height,
+    /// so siblings sitting at that height are never picked up.
     #[tokio::test]
-    async fn test_build_locator_excludes_non_confirmed_blocks() {
+    async fn test_build_locator_excludes_blocks_not_on_chain() {
         let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
         let genesis = genesis_for_tests();
 
@@ -1195,6 +1876,10 @@ mod tests {
             .organise_header(share_a.header.clone())
             .await
             .unwrap();
+        chain_handle
+            .mark_block_valid(share_a.block_hash())
+            .await
+            .unwrap();
         chain_handle.organise_block().await.unwrap();
 
         let share_b = TestShareBlockBuilder::new()
@@ -1205,6 +1890,10 @@ mod tests {
         chain_handle.add_share_block(share_b.clone()).await.unwrap();
         chain_handle
             .organise_header(share_b.header.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .mark_block_valid(share_b.block_hash())
             .await
             .unwrap();
         chain_handle.organise_block().await.unwrap();
@@ -1254,6 +1943,123 @@ mod tests {
         assert_eq!(locator[1], share_a.block_hash());
     }
 
+    /// The locator anchors on the candidate tip, not the confirmed tip.
+    ///
+    /// Confirmed lags candidate whenever bodies lag headers, so anchoring on
+    /// the confirmed tip made a restarting node re-request every header above
+    /// it.
+    #[tokio::test]
+    async fn test_build_locator_anchors_on_candidate_tip() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        // Confirmed chain reaches height 1.
+        let confirmed_share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .miner_pubkey("020202020202020202020202020202020202020202020202020202020202020202")
+            .work(2)
+            .build();
+        chain_handle
+            .add_share_block(confirmed_share.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .organise_header(confirmed_share.header.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .mark_block_valid(confirmed_share.block_hash())
+            .await
+            .unwrap();
+        chain_handle.organise_block().await.unwrap();
+
+        // Height 2 is header-only: on the candidate chain, never confirmed.
+        let candidate_share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(confirmed_share.block_hash().to_string())
+            .miner_pubkey("020202020202020202020202020202020202020202020202020202020202020202")
+            .work(2)
+            .build();
+        chain_handle
+            .add_share_block(candidate_share.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .organise_header(candidate_share.header.clone())
+            .await
+            .unwrap();
+
+        let locator = chain_handle.build_locator(0).unwrap();
+        assert_eq!(
+            locator[0],
+            candidate_share.block_hash(),
+            "locator must anchor on the candidate tip, not the confirmed tip"
+        );
+    }
+
+    /// The candidate walk keeps its genesis anchor.
+    ///
+    /// Genesis is registered on the confirmed chain only, so resolving each
+    /// height must fall back to the confirmed index. Without that fallback the
+    /// locator loses genesis, the peer matches nothing, and it answers with
+    /// genesis -- a full header refetch.
+    #[tokio::test]
+    async fn test_build_locator_keeps_genesis_anchor_above_confirmed() {
+        let (chain_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let genesis = genesis_for_tests();
+        chain_handle
+            .init_or_setup_genesis(genesis.clone())
+            .await
+            .unwrap();
+
+        let confirmed_share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .miner_pubkey("020202020202020202020202020202020202020202020202020202020202020202")
+            .work(2)
+            .build();
+        chain_handle
+            .add_share_block(confirmed_share.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .organise_header(confirmed_share.header.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .mark_block_valid(confirmed_share.block_hash())
+            .await
+            .unwrap();
+        chain_handle.organise_block().await.unwrap();
+
+        let candidate_share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(confirmed_share.block_hash().to_string())
+            .miner_pubkey("020202020202020202020202020202020202020202020202020202020202020202")
+            .work(2)
+            .build();
+        chain_handle
+            .add_share_block(candidate_share.clone())
+            .await
+            .unwrap();
+        chain_handle
+            .organise_header(candidate_share.header.clone())
+            .await
+            .unwrap();
+
+        let locator = chain_handle.build_locator(0).unwrap();
+        assert_eq!(
+            locator[locator.len() - 1],
+            genesis.block_hash(),
+            "locator must still end at genesis"
+        );
+        assert!(
+            locator.contains(&confirmed_share.block_hash()),
+            "locator must still cover the confirmed chain below the candidate tip"
+        );
+    }
+
     /// find_fork_point_height walks from a fork block back to the
     /// confirmed chain and returns the confirmed ancestor's height.
     ///
@@ -1285,6 +2091,10 @@ mod tests {
             chain_handle.add_share_block(share.clone()).await.unwrap();
             chain_handle
                 .organise_header(share.header.clone())
+                .await
+                .unwrap();
+            chain_handle
+                .mark_block_valid(share.block_hash())
                 .await
                 .unwrap();
             chain_handle.organise_block().await.unwrap();
@@ -1348,5 +2158,82 @@ mod tests {
         let unknown_hash = BlockHash::all_zeros();
         let result = chain_handle.find_fork_point_height(&unknown_hash).unwrap();
         assert_eq!(result, None);
+    }
+
+    /// A node that is not current never prunes, even with bodies far below
+    /// the target: its confirmed tip may lag the candidate tip.
+    #[tokio::test]
+    async fn test_prune_block_bodies_if_due_skips_when_not_current() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let blocks = build_confirmed_test_chain(&chain_store_handle, 4).await;
+        let mut next_prune_start = None;
+
+        chain_store_handle
+            .prune_block_bodies_if_due(&mut next_prune_start)
+            .await
+            .unwrap();
+
+        assert!(!chain_store_handle.is_current());
+        assert_eq!(next_prune_start, None);
+        assert!(
+            chain_store_handle
+                .store_handle()
+                .store()
+                .share_block_exists(&blocks[1].block_hash())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_confirmed_block_for_txid_returns_block_and_height() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let blocks = build_confirmed_test_chain(&chain_store_handle, 3).await;
+        let coinbase_txid = blocks[2].transactions[0].0.compute_txid();
+
+        let confirmed = chain_store_handle
+            .get_confirmed_block_for_txid(&coinbase_txid)
+            .unwrap();
+
+        assert_eq!(confirmed, Some((blocks[2].block_hash(), 2)));
+    }
+
+    /// The block is stored and on the candidate chain, so it has metadata,
+    /// but is never confirmed, as an uncle or fork block would be. Its
+    /// transactions have no confirmed block.
+    #[tokio::test]
+    async fn test_get_confirmed_block_for_txid_ignores_unconfirmed_block() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let blocks = build_confirmed_test_chain(&chain_store_handle, 2).await;
+        let unconfirmed = TestShareBlockBuilder::new()
+            .prev_share_blockhash(blocks[2].block_hash().to_string())
+            .add_transaction(test_funding_transaction(99))
+            .build();
+        chain_store_handle
+            .add_share_block_and_organise_header(unconfirmed.clone())
+            .await
+            .unwrap();
+        assert!(
+            chain_store_handle
+                .store_handle()
+                .store()
+                .share_block_exists(&unconfirmed.block_hash())
+        );
+
+        let confirmed = chain_store_handle
+            .get_confirmed_block_for_txid(&unconfirmed.transactions[0].0.compute_txid())
+            .unwrap();
+
+        assert_eq!(confirmed, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_confirmed_block_for_txid_unknown_txid_is_none() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        build_confirmed_test_chain(&chain_store_handle, 2).await;
+
+        let confirmed = chain_store_handle
+            .get_confirmed_block_for_txid(&bitcoin::Txid::from_byte_array([9; 32]))
+            .unwrap();
+
+        assert_eq!(confirmed, None);
     }
 }

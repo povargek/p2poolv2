@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::node::p2p_message_handlers::receivers::block_receiver::{
     BlockReceiverEvent, BlockReceiverHandle,
@@ -26,7 +14,6 @@ use crate::shares::chain::chain_store_handle::ChainStoreHandle;
 use crate::shares::chain::chain_store_handle::ChainStoreHandle;
 use crate::shares::share_block::ShareBlock;
 use crate::shares::validation::ShareValidator;
-use crate::store::block_tx_metadata::Status;
 use std::error::Error;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
@@ -67,10 +54,10 @@ pub async fn handle_share_block(
     // the process restarted after storing a block but before validation
     // completed.
     if chain_store_handle.share_block_exists(&block_hash) {
-        if !chain_store_handle.has_status(&block_hash, Status::Confirmed) {
+        if !chain_store_handle.is_block_confirmed(&block_hash) {
             debug!("Share block {block_hash} in store but not confirmed, re-sending to validation");
             if let Err(send_error) = validation_tx
-                .send(ValidationEvent::ValidateBlock(block_hash))
+                .send(ValidationEvent::ValidateBlockHash(block_hash))
                 .await
             {
                 error!("Failed to re-send block to validation worker: {send_error}");
@@ -85,6 +72,37 @@ pub async fn handle_share_block(
     if let Err(validation_error) = share_validator.validate_share_header(&share_block.header) {
         warn!("Rejecting share block {block_hash} with invalid header: {validation_error}");
         return Err(format!("Invalid share header: {validation_error}").into());
+    }
+
+    // Bind the header to its proof of work before buffering: a bitcoin
+    // header replayed under other share fields fails here, so it can never
+    // fill the pending buffer. The block carries its own coinbase branch.
+    if let Err(validation_error) = share_validator
+        .validate_coinbase_proof(&share_block.header, &share_block.template_merkle_branches)
+    {
+        warn!("Rejecting share block {block_hash} with invalid coinbase proof: {validation_error}");
+        return Err(format!("Invalid coinbase proof: {validation_error}").into());
+    }
+
+    // Bound the block's size before the BlockReceiver buffers it.
+    if let Err(validation_error) = share_validator.validate_block_size(&share_block) {
+        warn!("Rejecting oversized share block {block_hash}: {validation_error}");
+        return Err(format!("Oversized share block: {validation_error}").into());
+    }
+
+    // Tie the transactions to the hash the block is buffered and stored under.
+    // The block's identity is its header hash, so without this a peer can
+    // attach unrelated transactions -- including to a block we asked for by
+    // hash -- and have them buffered and stored. Runs after the size check so
+    // the work is bounded, and reads nothing but the block itself. A failure
+    // is a bad copy of the block, never stored, so the hash stays fetchable.
+    if let Err(validation_error) = share_validator.validate_body_matches_header(&share_block) {
+        warn!(
+            "Rejecting share block {block_hash} whose body does not match its header: {validation_error}"
+        );
+        return Err(
+            format!("Share block body does not match its header: {validation_error}").into(),
+        );
     }
 
     // Send to BlockReceiver actor for dependency buffering, ASERT
@@ -163,6 +181,15 @@ mod tests {
         mock_validator
             .expect_validate_share_header()
             .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_coinbase_proof()
+            .returning(|_, _| Ok(()));
+        mock_validator
+            .expect_validate_block_size()
+            .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_body_matches_header()
+            .returning(|_| Ok(()));
 
         let (validation_tx, _validation_rx) = validation_worker::create_validation_channel();
         let (block_receiver_handle, mut block_receiver_rx) = create_block_receiver_channel();
@@ -211,9 +238,9 @@ mod tests {
             .with(eq(block_hash))
             .returning(|_| true);
         chain_store_handle
-            .expect_has_status()
-            .with(eq(block_hash), eq(Status::Confirmed))
-            .returning(|_, _| true);
+            .expect_is_block_confirmed()
+            .with(eq(block_hash))
+            .returning(|_| true);
 
         let mock_validator = MockDefaultShareValidator::default();
 
@@ -255,9 +282,9 @@ mod tests {
             .with(eq(block_hash))
             .returning(|_| true);
         chain_store_handle
-            .expect_has_status()
-            .with(eq(block_hash), eq(Status::Confirmed))
-            .returning(|_, _| false);
+            .expect_is_block_confirmed()
+            .with(eq(block_hash))
+            .returning(|_| false);
 
         let mock_validator = MockDefaultShareValidator::default();
 
@@ -283,7 +310,10 @@ mod tests {
             .try_recv()
             .expect("Expected validation event for unconfirmed stored block");
         match event {
-            ValidationEvent::ValidateBlock(hash) => assert_eq!(hash, block_hash),
+            ValidationEvent::ValidateBlockHash(hash) => assert_eq!(hash, block_hash),
+            ValidationEvent::ValidateShareBlock(_) => {
+                panic!("Expected ValidateBlockHash, got ValidateShareBlock")
+            }
         }
     }
 
@@ -306,7 +336,7 @@ mod tests {
         mock_validator
             .expect_validate_share_header()
             .returning(|_| {
-                Err(ValidationError::new(
+                Err(ValidationError::consensus(
                     "Insufficient work: block hash does not meet share target",
                 ))
             });
@@ -351,6 +381,201 @@ mod tests {
         }
     }
 
+    /// An oversized block is rejected at the DoS gate, before the BlockReceiver
+    /// can buffer it. Until this check the only size bound is the transport's
+    /// A block whose transactions do not match its header's merkle root is
+    /// rejected before it reaches the BlockReceiver.
+    ///
+    /// A block's identity is its header hash, so without this check a peer can
+    /// attach arbitrary transactions -- including in reply to a block we asked
+    /// for by hash -- and have them buffered and stored under a hash that says
+    /// nothing about them. The header binds the transactions through its
+    /// proof's witness root, and checking it needs nothing but the block itself.
+    #[tokio::test]
+    async fn test_handle_share_block_body_not_matching_header_rejected_before_buffering() {
+        let mut chain_store_handle = ChainStoreHandle::default();
+        let test_data = load_share_headers_test_data();
+        let header: ShareHeader =
+            serde_json::from_value(test_data["valid_header"].clone()).unwrap();
+        let share_block = empty_share_block_from_header(header);
+        let block_hash = share_block.block_hash();
+
+        chain_store_handle
+            .expect_share_block_exists()
+            .with(eq(block_hash))
+            .returning(|_| false);
+
+        let mut mock_validator = MockDefaultShareValidator::default();
+        mock_validator
+            .expect_validate_share_header()
+            .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_coinbase_proof()
+            .returning(|_, _| Ok(()));
+        mock_validator
+            .expect_validate_block_size()
+            .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_body_matches_header()
+            .returning(|_| {
+                Err(ValidationError::consensus(
+                    "Share transactions witness root a does not match the header's b",
+                ))
+            });
+
+        let (validation_tx, _validation_rx) = validation_worker::create_validation_channel();
+        let (block_receiver_handle, mut block_receiver_rx) = create_block_receiver_channel();
+        let (block_fetcher_handle, _block_fetcher_rx) = create_block_fetcher_channel();
+
+        let result = handle_share_block(
+            share_block,
+            &chain_store_handle,
+            validation_tx,
+            &block_receiver_handle,
+            &block_fetcher_handle,
+            &mock_validator,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not match its header"),
+            "expected a body mismatch rejection"
+        );
+        assert!(
+            block_receiver_rx.try_recv().is_err(),
+            "a block whose transactions are not the ones its hash commits to must not be buffered"
+        );
+    }
+
+    /// A block whose coinbase proof fails is rejected before it is buffered.
+    /// The proof is what binds the share fields to the bitcoin header's proof
+    /// of work; without this gate one bitcoin header replays under unlimited
+    /// parents, each taking a pending slot it never releases.
+    #[tokio::test]
+    async fn test_handle_share_block_invalid_coinbase_proof_rejected_before_buffering() {
+        let mut chain_store_handle = ChainStoreHandle::default();
+        let test_data = load_share_headers_test_data();
+        let header: ShareHeader =
+            serde_json::from_value(test_data["valid_header"].clone()).unwrap();
+        let share_block = empty_share_block_from_header(header);
+        let block_hash = share_block.block_hash();
+
+        chain_store_handle
+            .expect_share_block_exists()
+            .with(eq(block_hash))
+            .returning(|_| false);
+
+        let mut mock_validator = MockDefaultShareValidator::default();
+        mock_validator
+            .expect_validate_share_header()
+            .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_coinbase_proof()
+            .returning(|_, _| {
+                Err(ValidationError::consensus(
+                    "Invalid coinbase proof: proof gives merkle root a, bitcoin header has b",
+                ))
+            });
+
+        let (validation_tx, _validation_rx) = validation_worker::create_validation_channel();
+        let (block_receiver_handle, mut block_receiver_rx) = create_block_receiver_channel();
+        let (block_fetcher_handle, _block_fetcher_rx) = create_block_fetcher_channel();
+
+        let result = handle_share_block(
+            share_block,
+            &chain_store_handle,
+            validation_tx,
+            &block_receiver_handle,
+            &block_fetcher_handle,
+            &mock_validator,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("coinbase proof"),
+            "expected a coinbase proof rejection"
+        );
+        assert!(
+            block_receiver_rx.try_recv().is_err(),
+            "a block not bound to its proof of work must not be buffered"
+        );
+    }
+
+    /// An oversized block is rejected before it is buffered. Without that check
+    /// the only bound on a received block is the transport's
+    /// `MAX_P2P_MESSAGE_SIZE`, so a single minimum-difficulty share could
+    /// otherwise pin up to a megabyte in the pending set.
+    #[tokio::test]
+    async fn test_handle_share_block_oversized_rejected_before_buffering() {
+        let mut chain_store_handle = ChainStoreHandle::default();
+        let test_data = load_share_headers_test_data();
+        let header: ShareHeader =
+            serde_json::from_value(test_data["valid_header"].clone()).unwrap();
+        let share_block = empty_share_block_from_header(header);
+        let block_hash = share_block.block_hash();
+
+        chain_store_handle
+            .expect_share_block_exists()
+            .with(eq(block_hash))
+            .returning(|_| false);
+
+        let mut mock_validator = MockDefaultShareValidator::default();
+        mock_validator
+            .expect_validate_share_header()
+            .returning(|_| Ok(()));
+        mock_validator
+            .expect_validate_coinbase_proof()
+            .returning(|_, _| Ok(()));
+        mock_validator.expect_validate_block_size().returning(|_| {
+            Err(ValidationError::consensus(
+                "Block transactions size 5000000 exceeds limit of 204800",
+            ))
+        });
+
+        let (validation_tx, mut validation_rx) = validation_worker::create_validation_channel();
+        let (block_receiver_handle, mut block_receiver_rx) = create_block_receiver_channel();
+        let (block_fetcher_handle, mut block_fetcher_rx) = create_block_fetcher_channel();
+
+        let result = handle_share_block(
+            share_block,
+            &chain_store_handle,
+            validation_tx,
+            &block_receiver_handle,
+            &block_fetcher_handle,
+            &mock_validator,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Oversized"),
+            "Expected oversized share block error"
+        );
+
+        assert!(
+            block_receiver_rx.try_recv().is_err(),
+            "An oversized block must never reach the BlockReceiver"
+        );
+        assert!(
+            validation_rx.try_recv().is_err(),
+            "No validation event expected for an oversized block"
+        );
+
+        // The fetcher is still cleared so it does not retry the request forever.
+        let fetcher_event = block_fetcher_rx
+            .try_recv()
+            .expect("Expected BlockRequestCompleted even for an oversized block");
+        match fetcher_event {
+            BlockFetcherEvent::BlockRequestCompleted(hash) => assert_eq!(hash, block_hash),
+            other => panic!("Expected BlockRequestCompleted, got: {other}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_share_block_confirmed_duplicate_notifies_block_fetcher() {
         let mut chain_store_handle = ChainStoreHandle::default();
@@ -365,9 +590,9 @@ mod tests {
             .with(eq(block_hash))
             .returning(|_| true);
         chain_store_handle
-            .expect_has_status()
-            .with(eq(block_hash), eq(Status::Confirmed))
-            .returning(|_, _| true);
+            .expect_is_block_confirmed()
+            .with(eq(block_hash))
+            .returning(|_| true);
 
         let mock_validator = MockDefaultShareValidator::default();
 

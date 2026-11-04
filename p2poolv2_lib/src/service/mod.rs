@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod p2p_service;
 
@@ -50,6 +38,9 @@ impl<C, T> PeerHandle<C, T> {
     ///
     /// Returns an error if the channel is full, meaning the peer's
     /// task cannot keep up with the inbound request rate.
+    // The Err variant is tokio's TrySendError, which hands the request back so
+    // the caller can retry or drop it; boxing would defeat that.
+    #[allow(clippy::result_large_err)]
     pub fn try_send(
         &self,
         request: RequestContext<C, T>,
@@ -259,7 +250,7 @@ mod tests {
         if let SwarmSend::Disconnect(disconnected_peer) = received {
             assert_eq!(disconnected_peer, peer_id);
         } else {
-            panic!("Expected SwarmSend::Disconnect, got {:?}", received);
+            panic!("Expected SwarmSend::Disconnect, got {received:?}");
         }
     }
 

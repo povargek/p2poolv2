@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use p2poolv2_lib::accounting::payout::sharechain_pplns::PplnsWindow;
 use p2poolv2_lib::accounting::stats::metrics;
@@ -196,6 +184,7 @@ async fn test_three_nodes_connectivity() {
 /// Load share blocks from the share_sync fixture file.
 ///
 /// Returns a vector of ShareBlock ordered by chain height (genesis first).
+#[cfg(not(feature = "sim"))]
 fn load_share_sync_blocks() -> Vec<ShareBlock> {
     let json_string = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -210,31 +199,33 @@ fn load_share_sync_blocks() -> Vec<ShareBlock> {
 /// Node 1 is seeded with 5 real share headers (from store.db fixture) before
 /// nodes 2 and 3 start. Nodes 2 and 3 dial into node 1 and should sync all
 /// shares via the header-sync and block-fetch protocol.
+///
+/// Skipped under the `sim` feature as under sim the difficulties from
+/// the fixtures don't work out.
+#[cfg(not(feature = "sim"))]
 #[test_log::test(tokio::test)]
 async fn test_three_nodes_share_sync() {
     let fixture_blocks = load_share_sync_blocks();
     let share_count = (fixture_blocks.len() - 1) as u32;
-    // Configure three nodes on unique ports with higher rate limit for fast sync
-    // Pool signature must match the cluster config that generated the fixture blocks
-    let pool_signature = Some("P2Poolv2".to_string());
+    // Configure three nodes on unique ports with higher rate limit for fast sync.
+    // No node sets a pool signature, while the fixture blocks carry "P2Poolv2":
+    // the signature is read from each block's coinbase, so it is not consensus
+    // and nodes with different signatures must still sync and confirm.
     let config1 = common::default_test_config()
         .with_listen_address("/ip4/127.0.0.1/tcp/6894".to_string())
         .with_store_path("test_sync_chain_1.db".to_string())
         .with_max_requests_per_second(100)
-        .with_pool_signature(pool_signature.clone())
         .with_api_port(3010);
     let config2 = common::default_test_config()
         .with_listen_address("/ip4/127.0.0.1/tcp/6895".to_string())
         .with_store_path("test_sync_chain_2.db".to_string())
         .with_max_requests_per_second(100)
-        .with_pool_signature(pool_signature.clone())
         .with_api_port(3011)
         .with_dial_peers(vec!["/ip4/127.0.0.1/tcp/6894".to_string()]);
     let config3 = common::default_test_config()
         .with_listen_address("/ip4/127.0.0.1/tcp/6896".to_string())
         .with_store_path("test_sync_chain_3.db".to_string())
         .with_max_requests_per_second(100)
-        .with_pool_signature(pool_signature)
         .with_api_port(3012)
         .with_dial_peers(vec!["/ip4/127.0.0.1/tcp/6894".to_string()]);
 
@@ -258,7 +249,9 @@ async fn test_three_nodes_share_sync() {
         .await
         .unwrap();
 
-    // Seed non-genesis shares from fixture into store 1
+    // Seed non-genesis shares from fixture into store 1. In-zone promotion
+    // requires BlockValid, so mark each validated before organising the
+    // confirmed chain (mirroring validate_and_promote_block in the node).
     for share_block in &fixture_blocks[1..] {
         chain_store_handle1
             .add_share_block(share_block.clone())
@@ -266,6 +259,10 @@ async fn test_three_nodes_share_sync() {
             .unwrap();
         chain_store_handle1
             .organise_header(share_block.header.clone())
+            .await
+            .unwrap();
+        chain_store_handle1
+            .mark_block_valid(share_block.block_hash())
             .await
             .unwrap();
         chain_store_handle1.organise_block().await.unwrap();

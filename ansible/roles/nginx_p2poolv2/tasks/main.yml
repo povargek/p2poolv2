@@ -1,0 +1,79 @@
+---
+# Nginx reverse proxy for P2Poolv2 (Debian/Ubuntu only)
+#
+# The role owns one site, p2poolv2.conf. Other sites are left alone unless
+# listed in p2poolv2_nginx_remove_sites.
+#
+# TLS certificates are not managed here: obtain and renew them on the host
+# (e.g. with certbot). The role deploys the full SSL config once every
+# certificate it references exists under /etc/letsencrypt/live, and an
+# HTTP-only config until then. Rerun the role after obtaining them.
+
+- name: Check the OS is supported
+  ansible.builtin.assert:
+    that: ansible_facts['os_family'] == "Debian"
+    fail_msg: >-
+      The nginx role supports Debian/Ubuntu only (sites-available and
+      sites-enabled layout). Set p2poolv2_nginx_enabled: false for this host.
+
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# --- Deploy the site config ---
+
+- name: Check which certificates exist
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ item }}/fullchain.pem"
+  loop: "{{ [p2poolv2_domain] + ([p2poolv2_grafana_domain] if p2poolv2_grafana_domain is defined else []) }}"
+  register: p2poolv2_certificates
+
+# The full config references every certificate, so it needs all of them
+- name: Decide whether all certificates are present
+  ansible.builtin.set_fact:
+    p2poolv2_certificates_present: "{{ p2poolv2_certificates.results | map(attribute='stat.exists') | min }}"
+
+- name: Deploy full nginx config with SSL
+  ansible.builtin.template:
+    src: p2poolv2_site.conf.j2
+    dest: /etc/nginx/sites-available/p2poolv2.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: p2poolv2_certificates_present | bool
+  notify: reload nginx
+
+- name: Deploy HTTP-only nginx config until certificates exist
+  ansible.builtin.template:
+    src: p2poolv2_http.conf.j2
+    dest: /etc/nginx/sites-available/p2poolv2.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: not p2poolv2_certificates_present | bool
+  notify: reload nginx
+
+- name: Enable nginx site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/p2poolv2.conf
+    dest: /etc/nginx/sites-enabled/p2poolv2.conf
+    state: link
+  notify: reload nginx
+
+# Removed only after p2poolv2.conf is in place, and both changes reach nginx
+# in the same tested reload
+- name: Remove replaced nginx site configs
+  ansible.builtin.file:
+    path: "/etc/nginx/sites-enabled/{{ item }}"
+    state: absent
+  loop: "{{ p2poolv2_nginx_remove_sites }}"
+  notify: reload nginx
+
+- name: Enable and start nginx
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started

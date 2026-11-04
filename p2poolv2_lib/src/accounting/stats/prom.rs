@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::accounting::stats::metrics::PoolMetrics;
 use std::time::SystemTime;
@@ -67,6 +55,16 @@ impl PoolMetrics {
         output.push_str(&format!(
             "last_update_seconds {}\n",
             self.lastupdate.unwrap_or(0)
+        ));
+        output.push('\n');
+
+        output.push_str(
+            "# HELP work_since_last_block Confirmed sharechain pool difficulty since the last bitcoin block was found\n",
+        );
+        output.push_str("# TYPE work_since_last_block gauge\n");
+        output.push_str(&format!(
+            "work_since_last_block {}\n",
+            self.work_since_last_block
         ));
         output.push('\n');
 
@@ -250,6 +248,19 @@ mod tests {
     }
 
     #[test]
+    fn test_effort_exposition() {
+        let metrics = PoolMetrics {
+            work_since_last_block: 12345.0,
+            ..Default::default()
+        };
+
+        let exposition = metrics.get_exposition();
+
+        assert!(exposition.contains("# TYPE work_since_last_block gauge"));
+        assert!(exposition.contains("work_since_last_block 12345"));
+    }
+
+    #[test]
     fn test_get_worker_expositions() {
         use crate::accounting::stats::worker::Worker;
 
@@ -340,13 +351,11 @@ mod tests {
         assert!(exposition.contains("# HELP worker_last_share_at"));
         assert!(exposition.contains("# TYPE worker_last_share_at gauge"));
         assert!(exposition.contains(&format!(
-            "worker_last_share_at{{btcaddress=\"bc1quser1\",workername=\"worker1\"}} {}",
-            recent
+            "worker_last_share_at{{btcaddress=\"bc1quser1\",workername=\"worker1\"}} {recent}"
         )));
         // Inactive worker2 should NOT be present
         assert!(!exposition.contains(&format!(
-            "worker_last_share_at{{btcaddress=\"bc1quser1\",workername=\"worker2\"}} {}",
-            recent
+            "worker_last_share_at{{btcaddress=\"bc1quser1\",workername=\"worker2\"}} {recent}"
         )));
 
         // Verify no p2pool_ prefix
@@ -408,8 +417,7 @@ mod tests {
             )
         );
         assert!(exposition.contains(&format!(
-            r#"worker_last_share_at{{btcaddress="bc1qtest",workername="unnamed"}} {}"#,
-            recent
+            r#"worker_last_share_at{{btcaddress="bc1qtest",workername="unnamed"}} {recent}"#
         )));
     }
 }

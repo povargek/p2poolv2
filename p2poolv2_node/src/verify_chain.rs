@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Debug tool that traverses the entire confirmed chain in a store.db
 //! and verifies structural integrity of all blocks.
@@ -23,7 +11,7 @@ use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
 use p2poolv2_lib::shares::validation::MAX_UNCLES;
 use p2poolv2_lib::store::Store;
-use p2poolv2_lib::store::block_tx_metadata::Status;
+use p2poolv2_lib::store::block_tx_metadata::ChainMembership;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::process;
@@ -65,14 +53,7 @@ fn is_uncle_ancestor_type(
     nephew_height: u32,
     confirmed_hashes: &HashMap<u32, BlockHash>,
 ) -> bool {
-    for height in 0..nephew_height {
-        if let Some(confirmed_hash) = confirmed_hashes.get(&height) {
-            if *confirmed_hash == *uncle_parent {
-                return true;
-            }
-        }
-    }
-    false
+    (0..nephew_height).any(|height| confirmed_hashes.get(&height) == Some(uncle_parent))
 }
 
 fn main() {
@@ -101,6 +82,15 @@ fn main() {
     };
 
     println!("Top confirmed height: {top_height}");
+
+    let prune_boundary = match store.prune_height() {
+        Ok(height) => height,
+        Err(error) => {
+            eprintln!("Failed to read prune height: {error}");
+            process::exit(1);
+        }
+    };
+    println!("Prune boundary: {prune_boundary} (blocks at or above this must have full data)");
 
     let mut summary = VerificationSummary::new();
 
@@ -154,38 +144,42 @@ fn main() {
             }
         };
 
-        // 3. Verify full block data exists
-        if !store.share_block_exists(&blockhash) {
-            summary.error(format!(
-                "h:{height} {blockhash} - block data missing (no txids in BlockTxids CF)"
-            ));
-        }
+        // 3. Verify full block data for blocks at or above prune boundary.
+        // Blocks below the boundary may or may not have data (pruning
+        // not yet implemented), so no check is performed for those.
+        if height >= prune_boundary {
+            if !store.share_block_exists(&blockhash) {
+                summary.error(format!(
+                    "h:{height} {blockhash} - block data missing (no txids in BlockTxids CF)"
+                ));
+            }
 
-        // 4. Verify share can be fully reconstructed
-        let share = store.get_share(&blockhash);
-        match &share {
-            Some(share_block) => {
-                // 5. Verify transactions non-empty (at least coinbase)
-                if share_block.transactions.is_empty() {
+            // 4. Verify share can be fully reconstructed
+            let share = store.get_share(&blockhash);
+            match &share {
+                Some(share_block) => {
+                    // 5. Verify transactions non-empty (at least coinbase)
+                    if share_block.transactions.is_empty() {
+                        summary.error(format!(
+                            "h:{height} {blockhash} - share has zero transactions (expected at least coinbase)"
+                        ));
+                    }
+                }
+                None => {
                     summary.error(format!(
-                        "h:{height} {blockhash} - share has zero transactions (expected at least coinbase)"
+                        "h:{height} {blockhash} - failed to reconstruct ShareBlock from store"
                     ));
                 }
             }
-            None => {
-                summary.error(format!(
-                    "h:{height} {blockhash} - failed to reconstruct ShareBlock from store"
-                ));
-            }
         }
 
-        // 6. Verify metadata exists and status is Confirmed
+        // 6. Verify metadata exists and chain membership is Confirmed
         match store.get_block_metadata(&blockhash) {
             Ok(metadata) => {
-                if metadata.status != Status::Confirmed {
-                    let status = metadata.status;
+                if metadata.chain != ChainMembership::Confirmed {
+                    let chain = metadata.chain;
                     summary.error(format!(
-                        "h:{height} {blockhash} - metadata status is {status:?}, expected Confirmed"
+                        "h:{height} {blockhash} - metadata chain is {chain:?}, expected Confirmed"
                     ));
                 }
 
@@ -272,10 +266,19 @@ fn main() {
                 }
             };
 
-            if !store.share_block_exists(uncle_hash) {
-                summary.warn(format!(
-                    "h:{height} {blockhash} - uncle {uncle_hash} block data missing (header-only)"
-                ));
+            match store.get_block_height_from_metadata(uncle_hash) {
+                Ok(uncle_height) => {
+                    if uncle_height >= prune_boundary && !store.share_block_exists(uncle_hash) {
+                        summary.warn(format!(
+                            "h:{height} {blockhash} - uncle {uncle_hash} (uncle h:{uncle_height}) block data missing (header-only)"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    summary.error(format!(
+                        "h:{height} {blockhash} - uncle {uncle_hash} metadata error: {error}"
+                    ));
+                }
             }
 
             // 10b. Uncle not referenced by another confirmed nephew
@@ -319,7 +322,7 @@ fn main() {
         }
 
         // Progress indicator every 1000 blocks
-        if height % 1000 == 0 && height > 0 {
+        if height.is_multiple_of(1000) && height > 0 {
             println!("  verified {height} / {top_height} confirmed blocks...");
         }
 

@@ -1,25 +1,18 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod address_filter;
 pub mod behaviour;
 pub mod connection_tracker;
+mod dns_seeds;
 pub mod emission_worker;
 pub mod organise_worker;
+pub mod p2p_health;
 pub mod peer_reconnector;
 pub mod request_response_handler;
+pub mod request_sender;
+pub mod response_worker;
 pub mod validation_worker;
 pub use crate::config::Config;
 pub mod actor;
@@ -29,23 +22,28 @@ pub mod p2p_message_handlers;
 use crate::accounting::payout::simple_pplns::SimplePplnsShare;
 use crate::monitoring_events::{MonitoringEvent, MonitoringEventSender, PeerResponse, PeerStatus};
 use crate::node::messages::Message;
+use crate::node::p2p_health::P2pHealth;
 use crate::node::p2p_message_handlers::receivers::block_receiver::BlockReceiverHandle;
-use crate::node::p2p_message_handlers::senders::send_handshake;
+use crate::node::p2p_message_handlers::senders::build_handshake_message;
 use crate::node::request_response_handler::RequestResponseHandler;
 use crate::node::request_response_handler::block_fetcher::BlockFetcherHandle;
+use crate::node::request_sender::RequestSender;
+use crate::node::response_worker::ResponseWorkerSender;
 use crate::node::validation_worker::ValidationSender;
 #[cfg(test)]
 #[mockall_double::double]
 use crate::shares::chain::chain_store_handle::ChainStoreHandle;
 #[cfg(not(test))]
 use crate::shares::chain::chain_store_handle::ChainStoreHandle;
+use crate::shares::share_block::ShareBlock;
 use crate::shares::validation::ShareValidator;
+use behaviour::request_response::protocol_string;
 use behaviour::{P2PoolBehaviour, P2PoolBehaviourEvent};
-use bitcoin::BlockHash;
 use libp2p::PeerId;
 use libp2p::SwarmBuilder;
 use libp2p::core::transport::Transport;
 use libp2p::identify;
+use libp2p::ping::Failure;
 use libp2p::request_response::ResponseChannel;
 use libp2p::tcp::Config as TcpConfig;
 use libp2p::{
@@ -86,14 +84,28 @@ impl<T> SwarmResponseChannelTrait<T> for SwarmResponseChannel<T> {
 pub enum SwarmSend<C> {
     Request(PeerId, Message),
     Response(C, Message),
-    /// Relay a block inventory announcement to connected peers.
-    /// Sent after a ShareBlock is successfully validated and stored, so
-    /// that other peers learn about the block and can request it via GetData.
-    Inv(BlockHash),
+    /// Broadcast a full ShareBlock to connected peers, filtering by
+    /// peer_block_knowledge. The actor records each recipient so that
+    /// subsequent broadcasts of the same block are suppressed.
+    BroadcastBlock(ShareBlock),
     Disconnect(PeerId),
+    /// Dial an address once, without reconnect tracking. Used for
+    /// addresses returned by DNS seeds.
+    Dial(Multiaddr),
 }
 
-use connection_tracker::{ConnectionAction, ConnectionTracker};
+use connection_tracker::{ConnectionAction, ConnectionTracker, PING_FAILURE_THRESHOLD};
+
+/// Close a connection after this long with no streams in use and no protocol
+/// asking to keep it alive.
+///
+/// A backstop only. Identify exchanges every 5 minutes, which counts as
+/// activity, so a healthy but quiet connection is never reaped -- the timeout
+/// must stay above that interval. For the same reason it does not catch a
+/// connection that negotiated but cannot carry p2pool messages (identify
+/// keeps working there); closing on repeated ping failures handles that. This
+/// only reaps connections where everything, identify included, has gone quiet.
+const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 600;
 
 /// Node is the main struct that represents the node
 struct Node {
@@ -102,13 +114,22 @@ struct Node {
     swarm_rx: mpsc::Receiver<SwarmSend<ResponseChannel<Message>>>,
     chain_store_handle: ChainStoreHandle,
     request_response_handler: RequestResponseHandler<ResponseChannel<Message>>,
-    config: Config,
     monitoring_event_sender: MonitoringEventSender,
     peer_reconnector: peer_reconnector::PeerReconnector,
     connection_tracker: ConnectionTracker,
+    /// Whether an external address has been confirmed and advertised
+    external_address_confirmed: bool,
+    /// Cached TCP listen port extracted from config
+    listen_port: Option<u16>,
+    /// Whether kademlia bootstrap has been triggered at least once
+    has_bootstrapped_kad: bool,
+    /// DNS seeds to fall back on, or None when disabled in config or the
+    /// network has none.
+    dns_seeds: Option<dns_seeds::DnsSeeds>,
 }
 
 impl Node {
+    #[allow(clippy::too_many_arguments)] // wiring constructor: each parameter is a distinct collaborator, a params struct would only move the list
     pub fn new(
         config: Config,
         chain_store_handle: ChainStoreHandle,
@@ -117,10 +138,16 @@ impl Node {
         block_receiver_handle: BlockReceiverHandle,
         monitoring_event_sender: MonitoringEventSender,
         share_validator: Arc<dyn ShareValidator + Send + Sync>,
+        response_worker_tx: ResponseWorkerSender,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let id_keys = libp2p::identity::Keypair::generate_ed25519();
 
-        let behavior = match P2PoolBehaviour::new(&id_keys, &config) {
+        let genesis_hash = ShareBlock::build_genesis_for_network(config.stratum.network)
+            .map_err(|error| -> Box<dyn Error> { error })?
+            .block_hash();
+        let network_protocol = protocol_string(config.stratum.network, genesis_hash);
+
+        let behavior = match P2PoolBehaviour::new(&id_keys, &config, genesis_hash) {
             Ok(behavior) => behavior,
             Err(err) => {
                 error!("Failed to create P2PoolBehaviour: {}", err);
@@ -132,7 +159,7 @@ impl Node {
 
         let tcp_config = TcpConfig::default().nodelay(true);
         let noise_config = match libp2p::noise::Config::new(&id_keys) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => cfg.with_prologue(network_protocol.as_bytes().to_vec()),
             Err(err) => {
                 error!("Failed to create Noise config: {}", err);
                 return Err(Box::new(err));
@@ -151,11 +178,34 @@ impl Node {
             .with_other_transport(|_| transport)?
             .with_behaviour(|_| behavior)?
             .with_swarm_config(|cfg| {
-                cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
+                cfg.with_idle_connection_timeout(Duration::from_secs(IDLE_CONNECTION_TIMEOUT_SECS))
             })
             .build();
 
         info!("Local peer id: {}", swarm.local_peer_id());
+        info!("P2P protocol string: {network_protocol}");
+
+        let listen_port = address_filter::extract_listen_port(&config.network.listen_address);
+
+        let external_address_confirmed =
+            if let Some(ref external_addr_str) = config.network.external_address {
+                match external_addr_str.parse::<Multiaddr>() {
+                    Ok(external_addr) => {
+                        info!("Using configured external address: {}", external_addr);
+                        swarm.add_external_address(external_addr);
+                        true
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Invalid external_address '{}' in config: {}",
+                            external_addr_str, error
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
 
         if !config.network.listen_address.is_empty() {
             match config.network.listen_address.parse() {
@@ -187,22 +237,28 @@ impl Node {
                     .into());
                 }
             }
+        }
 
-            for peer_addr in &config.network.dial_peers {
-                match peer_addr.parse::<Multiaddr>() {
-                    Ok(remote) => {
-                        if let Err(e) = swarm.dial(remote) {
-                            debug!("Failed to dial {}: {}", peer_addr, e);
-                        } else {
-                            info!("Dialed {}", peer_addr);
-                        }
+        for peer_addr in &config.network.dial_peers {
+            match peer_addr.parse::<Multiaddr>() {
+                Ok(remote) => {
+                    if let Err(e) = swarm.dial(remote) {
+                        debug!("Failed to dial {}: {}", peer_addr, e);
+                    } else {
+                        info!("Dialed {}", peer_addr);
                     }
-                    Err(e) => debug!("Invalid multiaddr {}: {}", peer_addr, e),
                 }
+                Err(e) => debug!("Invalid multiaddr {}: {}", peer_addr, e),
             }
         }
 
         let (swarm_tx, swarm_rx) = mpsc::channel(100);
+
+        let dns_seeds = if config.network.dns_seed {
+            dns_seeds::dns_seeds_for_network(config.stratum.network)
+        } else {
+            None
+        };
 
         let request_response_handler = RequestResponseHandler::new(
             config.network.clone(),
@@ -212,6 +268,7 @@ impl Node {
             validation_tx,
             block_receiver_handle,
             share_validator,
+            response_worker_tx,
         );
 
         let peer_reconnector = peer_reconnector::PeerReconnector::new(&config.network.dial_peers);
@@ -240,11 +297,31 @@ impl Node {
             swarm_rx,
             chain_store_handle,
             request_response_handler,
-            config,
             monitoring_event_sender,
             peer_reconnector,
             connection_tracker: ConnectionTracker::new(blocked_ips),
+            external_address_confirmed,
+            listen_port,
+            has_bootstrapped_kad: false,
+            dns_seeds,
         })
+    }
+
+    /// Queries the DNS seeds and dials the returned addresses, unless a peer
+    /// is already connected. The actor calls this once, after
+    /// dns_seeds::dns_seed_delay.
+    fn query_dns_seeds_if_isolated(&self) {
+        let connected_peer_count = self.connection_tracker.connected_peer_count();
+        match self.dns_seeds {
+            Some(seeds) if connected_peer_count == 0 => {
+                info!("No peers connected, querying DNS seeds");
+                dns_seeds::spawn_dns_seed_dials(seeds, self.swarm_tx.clone());
+            }
+            Some(_) => {
+                info!("Skipping DNS seeds, {connected_peer_count} peers already connected");
+            }
+            None => {}
+        }
     }
 
     /// Returns a Vec of peer IDs that are currently connected to this node
@@ -261,21 +338,28 @@ impl Node {
         Ok(())
     }
 
-    /// Send Message to all peers
-    pub fn send_to_all_peers(&mut self, message: Message) -> Result<(), Box<dyn Error>> {
-        debug!("Sending message to all peers");
-        let peer_ids: Vec<_> = self.swarm.connected_peers().cloned().collect();
-        for peer_id in peer_ids {
-            self.send_to_peer(&peer_id, message.clone())?;
+    /// Snapshot of P2P health counters for `/metrics`.
+    pub(crate) fn p2p_health(&self) -> P2pHealth {
+        P2pHealth {
+            connected_peers: self.connection_tracker.connected_peer_count(),
+            connections_total: self.connection_tracker.connections_total(),
+            ping_failures_total: self.connection_tracker.ping_failures_total(),
+            connections_closed_unresponsive_total: self
+                .connection_tracker
+                .connections_closed_unresponsive_total(),
+            outbound_failures_total: self.request_response_handler.outbound_failures_total(),
+            inbound_failures_total: self.request_response_handler.inbound_failures_total(),
+            responses_dropped_total: self.request_response_handler.responses_dropped_total(),
+            response_queue_depth: self.request_response_handler.response_queue_depth(),
         }
-        Ok(())
     }
 
     /// Attempt to reconnect to any configured dial_peers that are not currently connected.
     fn attempt_reconnections(&mut self) {
+        let connected_dial_addresses = self.connection_tracker.connected_dial_addresses();
         let addresses = self
             .peer_reconnector
-            .addresses_to_reconnect(&self.connection_tracker.connected_dial_addresses);
+            .addresses_to_reconnect(&connected_dial_addresses);
         for address in addresses {
             match self.swarm.dial(address.clone()) {
                 Ok(_) => {
@@ -316,17 +400,34 @@ impl Node {
     }
 
     /// Handle swarm events, these are events that are generated by the libp2p library
-    pub async fn handle_swarm_event(
+    pub fn handle_swarm_event(
         &mut self,
         event: SwarmEvent<P2PoolBehaviourEvent>,
     ) -> Result<(), Box<dyn Error>> {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                debug!("Listening on {address:?}");
+                info!("Listening on {address:?}");
+                if self.listen_port.is_none()
+                    && let Some(port) = address_filter::extract_tcp_port(&address)
+                {
+                    info!("Resolved actual listen port: {port}");
+                    self.listen_port = Some(port);
+                }
+                if !self.external_address_confirmed
+                    && address_filter::is_routable_multiaddr(&address)
+                {
+                    self.swarm.add_external_address(address.clone());
+                    self.external_address_confirmed = true;
+                    info!("Added routable listen address as external: {address}");
+                }
                 Ok(())
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                ..
             } => {
                 if let libp2p::core::ConnectedPoint::Dialer { ref address, .. } = endpoint {
                     self.peer_reconnector.record_dial_success(address);
@@ -340,20 +441,31 @@ impl Node {
                         let _ = self.swarm.disconnect_peer_id(peer_id);
                         return Ok(());
                     }
+                    // A further connection to an already connected peer needs
+                    // none of the per-peer setup: re-running add_peer would
+                    // replace the peer's request service and drop its queue.
+                    ConnectionAction::Accept(ref peer_info) if num_established.get() > 1 => {
+                        info!(
+                            "{:?} connection {} to already connected peer {} ({} open)",
+                            peer_info.direction, connection_id, peer_id, num_established
+                        );
+                        return Ok(());
+                    }
                     ConnectionAction::Accept(ref peer_info) => {
-                        if let Err(error) = send_handshake(
-                            peer_id,
-                            self.chain_store_handle.clone(),
-                            self.swarm_tx.clone(),
-                        )
-                        .await
-                        {
-                            error!("Failed to send handshake to peer {}: {}", peer_id, error);
-                        } else {
-                            debug!(
-                                "{:?} connection established, handshake sent to peer: {}",
-                                peer_info.direction, peer_id
-                            );
+                        match build_handshake_message(&self.chain_store_handle) {
+                            Ok(handshake_message) => {
+                                self.swarm.send_request(&peer_id, handshake_message);
+                                debug!(
+                                    "{:?} connection {} established, handshake sent to peer: {}",
+                                    peer_info.direction, connection_id, peer_id
+                                );
+                            }
+                            Err(error) => {
+                                error!(
+                                    "Failed to build handshake for peer {} on connection {}: {}",
+                                    peer_id, connection_id, error
+                                );
+                            }
                         }
                     }
                 }
@@ -368,12 +480,23 @@ impl Node {
                 Ok(())
             }
             SwarmEvent::ConnectionClosed {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                num_established,
+                ..
             } => {
-                info!("Disconnected from peer: {peer_id}");
-                self.connection_tracker.handle_closed(&peer_id, &endpoint);
+                self.connection_tracker.clear_ping_failures(connection_id);
+                self.connection_tracker
+                    .handle_closed(&peer_id, num_established);
+                if num_established > 0 {
+                    info!(
+                        "Closed connection {connection_id} to peer {peer_id}, {num_established} still open"
+                    );
+                    return Ok(());
+                }
+                info!("Disconnected from peer: {peer_id} on connection {connection_id}");
                 self.swarm.behaviour_mut().remove_peer(&peer_id);
-                self.request_response_handler.remove_peer(&peer_id).await;
+                self.request_response_handler.remove_peer(&peer_id);
                 let _ = self
                     .monitoring_event_sender
                     .send(MonitoringEvent::Peer(PeerResponse {
@@ -387,9 +510,6 @@ impl Node {
                 error,
                 connection_id,
             } => {
-                error!(
-                    "Failed to connect to peer: {peer_id:?}, error: {error}, connection_id: {connection_id}"
-                );
                 error!(
                     "Failed to connect to peer: {peer_id:?}, error: {error}, connection_id: {connection_id}"
                 );
@@ -408,11 +528,9 @@ impl Node {
                     self.handle_ping_event(ping_event);
                     Ok(())
                 }
-                P2PoolBehaviourEvent::RequestResponse(request_response_event) => {
-                    self.request_response_handler
-                        .handle_event(request_response_event)
-                        .await
-                }
+                P2PoolBehaviourEvent::RequestResponse(request_response_event) => self
+                    .request_response_handler
+                    .handle_event(request_response_event, &mut self.swarm),
             },
             _ => Ok(()),
         }
@@ -421,30 +539,75 @@ impl Node {
     /// Handle identify events, these are events that are generated by the identify protocol
     fn handle_identify_event(&mut self, event: identify::Event) {
         match event {
-            identify::Event::Received { peer_id, info } => {
+            identify::Event::Received {
+                peer_id,
+                info,
+                connection_id,
+            } => {
                 info!(
-                    "Identified Peer {} with protocol version {}",
-                    peer_id, info.protocol_version
+                    "Identified Peer {} on connection {} with protocol version {}",
+                    peer_id, connection_id, info.protocol_version
                 );
-                // Add the peer's advertised addresses to Kademlia
+                // Add the peer's routable advertised addresses to Kademlia
                 for addr in info.listen_addrs {
-                    self.swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, addr.clone());
+                    if address_filter::is_routable_multiaddr(&addr) {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, addr.clone());
+                    } else {
+                        debug!(
+                            "Skipping non-routable address {} from peer {}",
+                            addr, peer_id
+                        );
+                    }
                 }
-                // Note, we don't advertise observed_addr: its port is our
-                // ephemeral outbound source port, not a listen port.
-                debug!("Peer {} observed us as {}", peer_id, info.observed_addr);
-                if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
-                    warn!("Failed to bootstrap Kademlia: {}", e);
-                } else {
-                    debug!("Successfully started Kademlia bootstrap");
+                self.try_confirm_external_address(&info.observed_addr);
+                if !self.has_bootstrapped_kad {
+                    self.attempt_kademlia_bootstrap();
                 }
             }
             _ => {
                 debug!("Other identify event: {:?}", event);
             }
+        }
+    }
+
+    /// Triggers a kademlia bootstrap query to discover peers in the DHT.
+    /// Called once on first identify event and periodically thereafter.
+    fn attempt_kademlia_bootstrap(&mut self) {
+        match self.swarm.behaviour_mut().kademlia.bootstrap() {
+            Ok(_) => {
+                debug!("Started Kademlia bootstrap");
+                self.has_bootstrapped_kad = true;
+            }
+            Err(error) => {
+                warn!("Failed to bootstrap Kademlia: {error}");
+            }
+        }
+    }
+
+    /// Attempts to derive and confirm an external address from an identify
+    /// observation. Uses the observed IP combined with our listen port.
+    fn try_confirm_external_address(&mut self, observed_addr: &Multiaddr) {
+        if self.external_address_confirmed {
+            return;
+        }
+        let listen_port = match self.listen_port {
+            Some(port) => port,
+            None => {
+                debug!("No listen port configured, skipping external address detection");
+                return;
+            }
+        };
+        if let Some(external_addr) =
+            address_filter::build_external_address(observed_addr, listen_port)
+        {
+            info!("Detected external address from peer observation: {external_addr}");
+            self.swarm.add_external_address(external_addr);
+            self.external_address_confirmed = true;
+        } else {
+            debug!("Peer observed us as {observed_addr}, not usable as external address");
         }
     }
 
@@ -454,9 +617,39 @@ impl Node {
         match event.result {
             Ok(rtt) => {
                 debug!("Ping to {} succeeded, rtt: {:?}", event.peer, rtt);
+                self.connection_tracker
+                    .clear_ping_failures(event.connection);
             }
-            Err(ref error) => {
-                warn!("Ping to {} failed: {}", event.peer, error);
+            // The handler reports this once and then stops pinging; it says the
+            // peer lacks the protocol, not that the connection is dead, so it is
+            // not counted towards closing the connection.
+            Err(Failure::Unsupported) => {
+                warn!(
+                    "Peer {} on connection {} does not support ping",
+                    event.peer, event.connection
+                );
+            }
+            Err(error) => {
+                let failures = self
+                    .connection_tracker
+                    .record_ping_failure(event.connection);
+                warn!(
+                    "Ping to {} on connection {} failed ({failures} consecutive): {error}",
+                    event.peer, event.connection
+                );
+                // A connection can negotiate yet fail to exchange messages
+                // Close it so the reconnector dials a fresh one; only this connection,
+                // not a healthy sibling to the peer.
+                if failures >= PING_FAILURE_THRESHOLD {
+                    warn!(
+                        "Closing unresponsive connection {} to {} after {failures} ping failures",
+                        event.connection, event.peer
+                    );
+                    self.connection_tracker
+                        .clear_ping_failures(event.connection);
+                    self.connection_tracker.record_unresponsive_close();
+                    self.swarm.close_connection(event.connection);
+                }
             }
         }
     }
@@ -517,23 +710,26 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::ChainStoreHandle;
+    use super::P2PoolBehaviourEvent;
     use crate::config::{
-        ApiConfig, Config, LoggingConfig, NetworkConfig, StoreConfig, StratumConfig,
+        ApiConfig, Config, ElectrumConfig, LoggingConfig, NetworkConfig, StoreConfig, StratumConfig,
     };
     use crate::monitoring_events::create_monitoring_event_channel;
     use crate::node::Node;
     use crate::node::p2p_message_handlers::receivers::block_receiver::create_block_receiver_channel;
     use crate::node::request_response_handler::block_fetcher::create_block_fetcher_channel;
+    use crate::node::response_worker::create_response_worker_channel;
     use crate::node::validation_worker::create_validation_channel;
     use bitcoindrpc::BitcoinRpcConfig;
     use futures::StreamExt;
+    use libp2p::PeerId;
+    use libp2p::ping::Failure;
+    use libp2p::swarm::{ConnectionId, SwarmEvent};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn test_node_dial_timeout_does_not_hang() {
-        use libp2p::swarm::SwarmEvent;
-
         // Use a local address that will refuse connections immediately
         let unreachable_peer = "/ip4/127.0.0.1/tcp/65535".to_string(); // Fast fail
 
@@ -553,6 +749,8 @@ mod tests {
             max_requests_per_second: 1,
             dial_timeout_secs: 2,
             blocked_ips: vec![],
+            external_address: None,
+            dns_seed: false,
         };
         network_config.dial_peers = vec![unreachable_peer];
         network_config.dial_timeout_secs = 2;
@@ -566,7 +764,6 @@ mod tests {
             },
             store: StoreConfig {
                 path: "test_chain.db".to_string(),
-                background_task_frequency_hours: 1,
                 pplns_ttl_days: 3,
             },
 
@@ -585,6 +782,7 @@ mod tests {
                 auth_password: None,
                 cors_allowed: false,
             },
+            electrum: ElectrumConfig::default(),
         };
         config.network = network_config;
 
@@ -597,6 +795,7 @@ mod tests {
         let (validation_tx, _validation_rx) = create_validation_channel();
         let (block_receiver_handle, _block_receiver_rx) = create_block_receiver_channel();
         let (monitoring_tx, _monitoring_rx) = create_monitoring_event_channel();
+        let (response_worker_tx, _response_worker_rx) = create_response_worker_channel();
         let mut node = Node::new(
             config.clone(),
             chain_store_handle,
@@ -605,6 +804,7 @@ mod tests {
             block_receiver_handle,
             monitoring_tx,
             Arc::new(crate::shares::validation::MockDefaultShareValidator::default()),
+            response_worker_tx,
         )
         .expect("Node initialization failed");
 
@@ -632,13 +832,11 @@ mod tests {
                                     || err_str_lower.contains("connection refused")
                                     || err_str_lower
                                         .contains("failed to negotiate transport protocol"),
-                                "Expected timeout or connection refused error, got: {}",
-                                err_str
+                                "Expected timeout or connection refused error, got: {err_str}"
                             );
                             assert!(
                                 elapsed.as_secs_f32() <= 10.0,
-                                "Dialing took too long: {:?}, expected ~10s",
-                                elapsed
+                                "Dialing took too long: {elapsed:?}, expected ~10s"
                             );
                             break;
                         }
@@ -651,5 +849,328 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn build_test_config(listen_address: &str, external_address: Option<String>) -> Config {
+        Config {
+            network: NetworkConfig {
+                listen_address: listen_address.to_string(),
+                dial_peers: vec![],
+                max_pending_incoming: 10,
+                max_pending_outgoing: 10,
+                max_established_incoming: 10,
+                max_established_outgoing: 10,
+                max_established_per_peer: 10,
+                max_workbase_per_second: 10,
+                max_userworkbase_per_second: 10,
+                max_miningshare_per_second: 10,
+                max_inventory_per_second: 10,
+                max_transaction_per_second: 10,
+                max_requests_per_second: 1,
+                dial_timeout_secs: 2,
+                blocked_ips: vec![],
+                external_address,
+                dns_seed: false,
+            },
+            bitcoinrpc: BitcoinRpcConfig {
+                url: "http://localhost:8332".to_string(),
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            },
+            store: StoreConfig {
+                path: "test_chain.db".to_string(),
+                pplns_ttl_days: 3,
+            },
+            stratum: StratumConfig::new_for_test_default(),
+            logging: LoggingConfig {
+                console: Some(true),
+                level: "info".to_string(),
+                file: Some("./p2pool.log".to_string()),
+                stats_dir: "./logs/stats".to_string(),
+            },
+            api: ApiConfig {
+                hostname: "127.0.0.1".to_string(),
+                port: 3000,
+                auth_user: None,
+                auth_token: None,
+                auth_password: None,
+                cors_allowed: false,
+            },
+            electrum: ElectrumConfig::default(),
+        }
+    }
+
+    fn build_test_node(config: Config) -> Node {
+        let mut chain_store_handle = ChainStoreHandle::default();
+        chain_store_handle
+            .expect_clone()
+            .returning(ChainStoreHandle::default);
+        let (block_fetcher_tx, _block_fetcher_rx) = create_block_fetcher_channel();
+        let (validation_tx, _validation_rx) = create_validation_channel();
+        let (block_receiver_handle, _block_receiver_rx) = create_block_receiver_channel();
+        let (monitoring_tx, _monitoring_rx) = create_monitoring_event_channel();
+        let (response_worker_tx, _response_worker_rx) = create_response_worker_channel();
+        Node::new(
+            config,
+            chain_store_handle,
+            block_fetcher_tx,
+            validation_tx,
+            block_receiver_handle,
+            monitoring_tx,
+            Arc::new(crate::shares::validation::MockDefaultShareValidator::default()),
+            response_worker_tx,
+        )
+        .expect("Node initialization failed")
+    }
+
+    #[tokio::test]
+    async fn test_config_external_address_is_added_to_swarm() {
+        let config = build_test_config(
+            "/ip4/127.0.0.1/tcp/0",
+            Some("/ip4/203.0.113.5/tcp/6884".to_string()),
+        );
+        let node = build_test_node(config);
+
+        let external_addrs: Vec<_> = node.swarm.external_addresses().cloned().collect();
+        let expected: libp2p::Multiaddr = "/ip4/203.0.113.5/tcp/6884".parse().unwrap();
+        assert!(
+            external_addrs.contains(&expected),
+            "Expected external address {expected} not found in {external_addrs:?}"
+        );
+        assert!(node.external_address_confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_dns_seeds_enabled_on_network_with_seeds() {
+        let mut config = build_test_config("", None);
+        config.stratum.network = bitcoin::Network::Testnet4;
+        config.network.dns_seed = true;
+        let node = build_test_node(config);
+
+        assert!(node.dns_seeds.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dns_seeds_disabled_by_config() {
+        let mut config = build_test_config("", None);
+        config.stratum.network = bitcoin::Network::Testnet4;
+        config.network.dns_seed = false;
+        let node = build_test_node(config);
+
+        assert!(node.dns_seeds.is_none());
+    }
+
+    /// A node that does not listen still dials its configured peers.
+    #[tokio::test]
+    async fn test_dial_peers_are_dialed_without_listen_address() {
+        let mut config = build_test_config("", None);
+        config.network.dial_peers = vec!["/ip4/127.0.0.1/tcp/65535".to_string()];
+        let node = build_test_node(config);
+
+        assert_eq!(
+            node.swarm
+                .network_info()
+                .connection_counters()
+                .num_pending_outgoing(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_config_external_address_leaves_unconfirmed() {
+        let config = build_test_config("/ip4/127.0.0.1/tcp/0", None);
+        let node = build_test_node(config);
+
+        let external_addrs: Vec<_> = node.swarm.external_addresses().cloned().collect();
+        assert!(
+            external_addrs.is_empty(),
+            "Expected no external addresses, got {external_addrs:?}"
+        );
+        assert!(!node.external_address_confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_try_confirm_from_routable_observation() {
+        let config = build_test_config("/ip4/127.0.0.1/tcp/0", None);
+        let mut node = build_test_node(config);
+        node.listen_port = Some(7001);
+
+        assert!(!node.external_address_confirmed);
+
+        let observed: libp2p::Multiaddr = "/ip4/93.184.216.34/tcp/54321".parse().unwrap();
+        node.try_confirm_external_address(&observed);
+
+        assert!(node.external_address_confirmed);
+        let external_addrs: Vec<_> = node.swarm.external_addresses().cloned().collect();
+        let expected: libp2p::Multiaddr = "/ip4/93.184.216.34/tcp/7001".parse().unwrap();
+        assert!(
+            external_addrs.contains(&expected),
+            "Expected external address {expected} not found in {external_addrs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_confirm_ignores_private_observation() {
+        let config = build_test_config("/ip4/127.0.0.1/tcp/0", None);
+        let mut node = build_test_node(config);
+        node.listen_port = Some(7002);
+
+        let observed: libp2p::Multiaddr = "/ip4/192.168.1.1/tcp/54321".parse().unwrap();
+        node.try_confirm_external_address(&observed);
+
+        assert!(!node.external_address_confirmed);
+        let external_addrs: Vec<_> = node.swarm.external_addresses().cloned().collect();
+        assert!(
+            external_addrs.is_empty(),
+            "Expected no external addresses, got {external_addrs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_confirm_noop_when_already_confirmed() {
+        let config = build_test_config(
+            "/ip4/127.0.0.1/tcp/0",
+            Some("/ip4/203.0.113.5/tcp/7003".to_string()),
+        );
+        let mut node = build_test_node(config);
+        node.listen_port = Some(7003);
+        assert!(node.external_address_confirmed);
+
+        let observed: libp2p::Multiaddr = "/ip4/198.51.100.99/tcp/54321".parse().unwrap();
+        node.try_confirm_external_address(&observed);
+
+        let external_addrs: Vec<_> = node.swarm.external_addresses().cloned().collect();
+        let should_not_exist: libp2p::Multiaddr = "/ip4/198.51.100.99/tcp/7003".parse().unwrap();
+        assert!(
+            !external_addrs.contains(&should_not_exist),
+            "Second observation should not override confirmed address"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_confirm_noop_when_no_listen_port() {
+        let config = build_test_config("/ip4/127.0.0.1/tcp/0", None);
+        let mut node = build_test_node(config);
+        assert!(node.listen_port.is_none());
+
+        let observed: libp2p::Multiaddr = "/ip4/198.51.100.7/tcp/54321".parse().unwrap();
+        node.try_confirm_external_address(&observed);
+
+        assert!(!node.external_address_confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_new_listen_addr_resolves_ephemeral_port() {
+        let config = build_test_config("/ip4/127.0.0.1/tcp/0", None);
+        let mut node = build_test_node(config);
+        assert!(node.listen_port.is_none());
+
+        let resolved_addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/45678".parse().unwrap();
+        let event = SwarmEvent::NewListenAddr {
+            listener_id: libp2p::core::transport::ListenerId::next(),
+            address: resolved_addr,
+        };
+        node.handle_swarm_event(event).unwrap();
+
+        assert_eq!(node.listen_port, Some(45678));
+    }
+
+    fn ping_failure(peer: PeerId, connection: ConnectionId) -> libp2p::ping::Event {
+        libp2p::ping::Event {
+            peer,
+            connection,
+            result: Err(Failure::Timeout),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ping_threshold_closes_connection_and_clears_count() {
+        let mut node = build_test_node(build_test_config("/ip4/127.0.0.1/tcp/0", None));
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(7);
+
+        node.handle_ping_event(ping_failure(peer, connection));
+        node.handle_ping_event(ping_failure(peer, connection));
+        assert_eq!(node.connection_tracker.ping_failures(connection), 2);
+
+        // The third reported failure reaches the threshold: the connection is
+        // closed and its count reset.
+        node.handle_ping_event(ping_failure(peer, connection));
+        assert_eq!(node.connection_tracker.ping_failures(connection), 0);
+
+        let health = node.p2p_health();
+        assert_eq!(health.ping_failures_total, 3);
+        assert_eq!(health.connections_closed_unresponsive_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ping_success_resets_failure_count() {
+        let mut node = build_test_node(build_test_config("/ip4/127.0.0.1/tcp/0", None));
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(7);
+
+        node.handle_ping_event(ping_failure(peer, connection));
+        node.handle_ping_event(ping_failure(peer, connection));
+        assert_eq!(node.connection_tracker.ping_failures(connection), 2);
+
+        node.handle_ping_event(libp2p::ping::Event {
+            peer,
+            connection,
+            result: Ok(Duration::from_millis(20)),
+        });
+        assert_eq!(node.connection_tracker.ping_failures(connection), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ping_unsupported_is_not_counted() {
+        let mut node = build_test_node(build_test_config("/ip4/127.0.0.1/tcp/0", None));
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(7);
+
+        node.handle_ping_event(libp2p::ping::Event {
+            peer,
+            connection,
+            result: Err(Failure::Unsupported),
+        });
+        assert_eq!(node.connection_tracker.ping_failures(connection), 0);
+
+        node.handle_ping_event(ping_failure(peer, connection));
+        assert_eq!(node.connection_tracker.ping_failures(connection), 1);
+    }
+
+    fn connection_closed(
+        peer_id: PeerId,
+        connection: u64,
+        remaining: u32,
+    ) -> SwarmEvent<P2PoolBehaviourEvent> {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id: ConnectionId::new_unchecked(connection as usize),
+            endpoint: libp2p::core::ConnectedPoint::Dialer {
+                address: "/ip4/1.2.3.4/tcp/46884".parse().unwrap(),
+                role_override: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::New,
+            },
+            num_established: remaining,
+            cause: None,
+        }
+    }
+
+    /// Closing one of two connections to a peer must keep its request service:
+    /// removing it would drop the peer's queued requests while it is still
+    /// connected. Only the last close tears the peer down.
+    #[tokio::test]
+    async fn test_peer_torn_down_only_when_last_connection_closes() {
+        let mut node = build_test_node(build_test_config("/ip4/127.0.0.1/tcp/0", None));
+        let peer = PeerId::random();
+        node.request_response_handler.add_peer(peer);
+
+        node.handle_swarm_event(connection_closed(peer, 1, 1))
+            .unwrap();
+        assert!(node.request_response_handler.has_peer(&peer));
+
+        node.handle_swarm_event(connection_closed(peer, 2, 0))
+            .unwrap();
+        assert!(!node.request_response_handler.has_peer(&peer));
     }
 }

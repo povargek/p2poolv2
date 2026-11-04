@@ -1,33 +1,41 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::block_tx_metadata::{BlockMetadata, Status};
 use super::{ColumnFamily, Store, writer::StoreError};
 use crate::shares::chain::chain_store_handle::{COMMON_ANCESTOR_DEPTH, ConfirmedHeaderResult};
-use crate::shares::share_block::{ShareBlock, ShareHeader};
+use crate::shares::share_block::{ShareBlock, ShareHeader, is_terminal_blockhash};
 use crate::shares::validation::MAX_UNCLES;
+use bitcoin::WitnessProgram;
 use bitcoin::consensus::{self, Encodable, encode};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, CompactTarget, Work};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Max depth to look for uncles when building new share blocks
 pub const MAX_UNCLES_DEPTH: u8 = 3;
+
+/// Number of blocks above which `find_best_block_valid_descendant` logs that
+/// its walk was large. It never stops the walk.
+///
+/// The walk covers the validated, unconfirmed subtree above the confirmed tip
+/// plus one metadata read per non-validated child. That is a handful of blocks
+/// in normal operation; a walk past this threshold means confirmation has been
+/// lagging for a while (about three hours of shares at 10s each).
+const MINING_BASE_SEARCH_WARN_BLOCKS: usize = 1024;
+
+/// Outcome of the mining base search, `find_best_block_valid_descendant`.
+pub(crate) enum BlockValidSearch {
+    /// A validated descendant of the confirmed tip to mine on.
+    Found(BlockHash),
+    /// No validated descendant was found. `visited` distinguishes "nothing
+    /// above the confirmed tip yet" (zero) from "blocks are there but none of
+    /// them is validated", which means confirmation is not keeping up.
+    NotFound { visited: usize },
+}
 
 /// Maximum number of blocks included per height in getheaders responses.
 ///
@@ -42,7 +50,14 @@ pub struct ShareInfo {
     pub blockhash: BlockHash,
     pub prev_blockhash: BlockHash,
     pub height: u32,
-    pub miner_address: String,
+    pub miner_bitcoin_address: String,
+    /// Miner address, as the witness program the header stores.
+    ///
+    /// Not the bech32m form: rendering that needs a network, and the store is
+    /// network agnostic by design. The API and CLI layers hold the configured
+    /// network and render it there.
+    #[serde(with = "p2poolv2_wallet::witness_program_codec::serde_hex")]
+    pub miner_address: WitnessProgram,
     pub timestamp: u32,
     pub bits: CompactTarget,
     pub uncles: Vec<UncleInfo>,
@@ -53,7 +68,11 @@ pub struct ShareInfo {
 pub struct UncleInfo {
     pub blockhash: BlockHash,
     pub prev_blockhash: BlockHash,
-    pub miner_address: String,
+    pub miner_bitcoin_address: String,
+    /// Miner address, as the witness program the header stores. See
+    /// [`ShareInfo::miner_address`].
+    #[serde(with = "p2poolv2_wallet::witness_program_codec::serde_hex")]
+    pub miner_address: WitnessProgram,
     pub timestamp: u32,
     pub height: Option<u32>,
 }
@@ -186,7 +205,7 @@ impl Store {
         stop_blockhash: &BlockHash,
         limit: usize,
     ) -> Result<Vec<BlockHash>, StoreError> {
-        let start_blockhash = self.first_known_for_locator(locator);
+        let start_blockhash = self.first_known_for_locator(locator)?;
         // If no blockhash found, return vector with genesis block
         let start_blockhash = match start_blockhash {
             Some(hash) => hash,
@@ -210,17 +229,23 @@ impl Store {
     /// blocks at each height regardless of status, so matching any
     /// valid block is correct. The locator is ordered newest-first, so
     /// the first match gives the highest known height.
-    fn first_known_for_locator(&self, locator: &[BlockHash]) -> Option<BlockHash> {
-        let metadata_results: HashMap<BlockHash, BlockMetadata> =
-            self.get_block_metadata_batch(locator).into_iter().collect();
+    fn first_known_for_locator(
+        &self,
+        locator: &[BlockHash],
+    ) -> Result<Option<BlockHash>, StoreError> {
+        let metadata_results: HashMap<BlockHash, BlockMetadata> = self
+            .get_block_metadata_batch(locator)?
+            .into_iter()
+            .collect();
         for blockhash in locator {
-            if let Some(metadata) = metadata_results.get(blockhash) {
-                if metadata.status != Status::Pending && metadata.status != Status::Invalid {
-                    return Some(*blockhash);
-                }
+            if let Some(metadata) = metadata_results.get(blockhash)
+                && metadata.status != Status::Pending
+                && metadata.status != Status::Invalid
+            {
+                return Ok(Some(*blockhash));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Get headers to satisfy the locator query.
@@ -388,15 +413,6 @@ impl Store {
         Ok(())
     }
 
-    /// Check if a blockhash has been used as an uncle
-    pub fn is_already_uncle(&self, blockhash: &BlockHash) -> bool {
-        let uncles_cf = self.db.cf_handle(&ColumnFamily::Uncles).unwrap();
-        matches!(
-            self.db.get_cf::<&[u8]>(&uncles_cf, blockhash.as_ref()),
-            Ok(Some(_))
-        )
-    }
-
     /// Get the nephews that have included a blockhash as an uncle
     pub fn get_nephews(&self, uncle: &BlockHash) -> Option<Vec<BlockHash>> {
         let uncles_cf = self.db.cf_handle(&ColumnFamily::Uncles).unwrap();
@@ -406,54 +422,86 @@ impl Store {
         }
     }
 
-    /// Finds uncles up to max depth and return a vector of all found
-    /// uncle BlockHashes, sorted by chain_work descending.
+    /// Finds uncles for a share built on `base_hash`, sorted by
+    /// chain_work descending.
     ///
-    /// Algorithm: Find ancestors up to max uncle depth on the
-    /// confirmed chain, not counting the parent. Find all children of
-    /// these ancestors that are not on the confirmed chain, not the
-    /// chain tip (parent), and not already included as uncles in other
-    /// blocks. Return the top MAX_UNCLES by chain_work.
-    pub fn find_uncles(&self) -> Result<Vec<BlockHash>, StoreError> {
-        let top_confirmed_height = match self.get_top_confirmed_height() {
-            Ok(height) => height,
-            Err(StoreError::NotFound(_)) => {
-                // No top confirmation yet; no uncles can be found.
-                return Ok(Vec::new());
+    /// Algorithm: walk the base's ancestry up to `MAX_UNCLES_DEPTH` parent
+    /// pointers, collecting the uncles listed by the base and its ancestors.
+    /// The children of those ancestors that are not themselves on the base's
+    /// ancestry, not on the confirmed chain, not already listed as an uncle on
+    /// this ancestry, and have their block body stored are the uncle
+    /// candidates. Return the top `MAX_UNCLES` by chain_work.
+    ///
+    /// The listed-uncle exclusion matches the validation rule that an uncle
+    /// appears at most once per chain. It looks only at the base's ancestry,
+    /// so an uncle listed by a nephew on a losing branch is still available.
+    ///
+    /// Anchoring on `base_hash` (the nephew's parent) rather than the
+    /// confirmed tip keeps every returned uncle within `MAX_UNCLES_DEPTH` of
+    /// the nephew even when the base leads the confirmed chain on a
+    /// `BlockValid` fork -- so the produced share passes the uncle-depth
+    /// check that validation applies. The body check prevents selecting
+    /// header-only blocks (received via header sync without a body), which
+    /// would create shares that reference uncle data no node can serve.
+    ///
+    /// Selected uncles must also be at least header-validated, which skips
+    /// `Invalid` and `Pending` blocks.
+    pub fn find_uncles(&self, base_hash: &BlockHash) -> Result<Vec<BlockHash>, StoreError> {
+        let mut ancestors: Vec<BlockHash> = Vec::with_capacity(MAX_UNCLES_DEPTH as usize);
+        let mut ancestry: HashSet<BlockHash> =
+            HashSet::with_capacity(MAX_UNCLES_DEPTH as usize + 1);
+        let mut uncles_listed_on_ancestry: HashSet<BlockHash> =
+            HashSet::with_capacity(MAX_UNCLES_DEPTH as usize * MAX_UNCLES);
+        ancestry.insert(*base_hash);
+        let mut current = *base_hash;
+        let mut steps = 0;
+        while steps < MAX_UNCLES_DEPTH as usize && !is_terminal_blockhash(&current) {
+            let parent = match self.get_share_header(&current)? {
+                Some(header) => {
+                    uncles_listed_on_ancestry.extend(header.uncles.iter().copied());
+                    header.prev_share_blockhash
+                }
+                None => return Ok(Vec::new()),
+            };
+            if !is_terminal_blockhash(&parent) {
+                ancestors.push(parent);
+                ancestry.insert(parent);
             }
-            Err(e) => return Err(e),
-        };
+            current = parent;
+            steps += 1;
+        }
 
-        let chain_tip = self.get_chain_tip()?;
+        let children = ancestors.iter().flat_map(|ancestor| {
+            self.get_children_blockhashes(ancestor)
+                .ok()
+                .flatten()
+                .into_iter()
+                .flatten()
+                .map(move |child| (*ancestor, child))
+        });
 
-        // get all ancestors up to required depth on the confirmed index
-        let ancestors = (top_confirmed_height.saturating_sub(MAX_UNCLES_DEPTH as u32)
-            ..top_confirmed_height)
-            .filter_map(|height| self.get_confirmed_at_height(height).ok());
-
-        // get all children for the ancestors, will give us all uncles and confirmed blocks
-        let children = ancestors
-            .filter_map(|blockhash| self.get_children_blockhashes(&blockhash).ok())
-            .flatten()
-            .flatten();
-
-        // Only keep the non-confirmed blocks that are not used as
-        // uncles already and that are not the chain tip (parent).
-        let mut uncles_with_work: Vec<(BlockHash, Work)> = children
-            .filter(|blockhash| {
-                *blockhash != chain_tip
+        let uncles_with_work: HashSet<(BlockHash, Work)> = children
+            .filter(|(_, blockhash)| {
+                !ancestry.contains(blockhash)
                     && !self.is_confirmed(blockhash)
-                    && !self.is_already_uncle(blockhash)
+                    && !uncles_listed_on_ancestry.contains(blockhash)
+                    && self.share_block_exists(blockhash)
             })
-            .filter_map(|blockhash| {
+            .filter(|(ancestor, blockhash)| self.is_child_of(blockhash, ancestor))
+            .filter_map(|(_, blockhash)| {
                 self.get_block_metadata(&blockhash)
                     .ok()
+                    .filter(|metadata| {
+                        matches!(metadata.status, Status::HeaderValid | Status::BlockValid)
+                    })
                     .map(|metadata| (blockhash, metadata.chain_work))
             })
             .collect();
 
-        // Sort by chain_work descending and take top MAX_UNCLES
-        uncles_with_work.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by chain_work descending then blockhash ascending and take top MAX_UNCLES
+        let mut uncles_with_work: Vec<(BlockHash, Work)> = uncles_with_work.into_iter().collect();
+        uncles_with_work.sort_by_key(|(blockhash, work)| (std::cmp::Reverse(*work), *blockhash));
+
         let uncles = uncles_with_work
             .into_iter()
             .take(MAX_UNCLES)
@@ -461,6 +509,119 @@ impl Store {
             .collect();
 
         Ok(uncles)
+    }
+
+    /// Find the highest-work `BlockValid` descendant of `from`.
+    ///
+    /// This is the mining base search. It walks forward from the confirmed tip
+    /// over the descendant subtree, so it finds blocks we have fully validated
+    /// even when they sit off the candidate chain -- which is the normal state
+    /// when the candidate chain has reorged onto a peer's header-only fork and
+    /// our own mined blocks are the only validated ones above the confirmed
+    /// tip. Reading the answer from the DAG on demand, rather than caching a
+    /// pointer, means there is no invariant to maintain across invalidation,
+    /// reorg and restart.
+    ///
+    /// Only `BlockValid` blocks are walked into. Validation is parent-gated --
+    /// a block is validated only once its parent is `BlockValid` or confirmed
+    /// -- so no block below a non-`BlockValid` one is validated, and skipping
+    /// its subtree loses no answer. In particular an `Invalid` block hides its
+    /// whole subtree, and header-only blocks, which header sync stores a full
+    /// response at a time, cost the search one metadata read each.
+    ///
+    /// The walk is not bounded. What remains is the validated, unconfirmed
+    /// subtree, which grows only at real hashrate and only while confirmation
+    /// lags. A bound would end the walk at the same shallow block on every job
+    /// refresh, pinning every share onto one parent as a sibling that adds no
+    /// work. A walk larger than `MINING_BASE_SEARCH_WARN_BLOCKS` is logged.
+    ///
+    /// Ranking is by cumulative work, ties broken by the lexicographically
+    /// smallest hash, so every node picks the same base. A `BlockValid` block
+    /// with a `BlockValid` child always loses to that child on work, so the
+    /// winner is a tip of the validated subtree without needing a separate
+    /// check for it.
+    pub(crate) fn find_best_block_valid_descendant(
+        &self,
+        from: &BlockHash,
+    ) -> Result<BlockValidSearch, StoreError> {
+        let mut queue: VecDeque<BlockHash> = self.children_blockhashes(from).into();
+        let mut visited = 0;
+        let mut best: Option<(BlockHash, Work)> = None;
+
+        while let Some(blockhash) = queue.pop_front() {
+            visited += 1;
+
+            // A block whose metadata cannot be read is skipped like any
+            // non-BlockValid block, which also drops its subtree. That is not
+            // propagated: this search is best-effort with a documented
+            // fallback to the confirmed tip, and `children_blockhashes` already
+            // treats read errors as no children, whereas an error here would
+            // travel through `get_mining_base` into the notify build and stop
+            // the node. It is logged so the pruning is not silent.
+            let metadata = match self.get_block_metadata(&blockhash) {
+                Ok(metadata) => Some(metadata),
+                Err(StoreError::NotFound(_)) => None,
+                Err(error) => {
+                    warn!(
+                        "Skipping {blockhash} and its subtree in the mining base search: {error}"
+                    );
+                    None
+                }
+            };
+            if let Some(metadata) =
+                metadata.filter(|metadata| metadata.status == Status::BlockValid)
+            {
+                let outranks_best = match best {
+                    Some((best_hash, best_work)) => {
+                        metadata.chain_work > best_work
+                            || (metadata.chain_work == best_work && blockhash < best_hash)
+                    }
+                    None => true,
+                };
+                if outranks_best {
+                    best = Some((blockhash, metadata.chain_work));
+                }
+                queue.extend(self.children_blockhashes(&blockhash));
+            }
+        }
+
+        if visited > MINING_BASE_SEARCH_WARN_BLOCKS {
+            warn!(
+                "Mining base search visited {visited} blocks above {from}: confirmation is lagging"
+            );
+        }
+
+        match best {
+            Some((blockhash, _)) => Ok(BlockValidSearch::Found(blockhash)),
+            None => Ok(BlockValidSearch::NotFound { visited }),
+        }
+    }
+
+    /// Children that actually name `blockhash` as their parent.
+    ///
+    /// `BlockIndex` also holds uncle -> nephew edges under the same key, so
+    /// the raw entry cannot be walked as a descendant list (see
+    /// `find_uncles`). Read errors yield no children.
+    fn children_blockhashes(&self, blockhash: &BlockHash) -> Vec<BlockHash> {
+        self.get_children_blockhashes(blockhash)
+            .ok()
+            .flatten()
+            .into_iter()
+            .flatten()
+            .filter(|child| self.is_child_of(child, blockhash))
+            .collect()
+    }
+
+    /// Whether `blockhash` names `parent_hash` as its parent.
+    ///
+    /// Distinguishes a real parent -> child edge from the uncle -> nephew edge
+    /// stored under the same `BlockIndex` key. A block whose header cannot be
+    /// read is not treated as a child.
+    fn is_child_of(&self, blockhash: &BlockHash, parent_hash: &BlockHash) -> bool {
+        self.get_share_header(blockhash)
+            .ok()
+            .flatten()
+            .is_some_and(|header| header.prev_share_blockhash == *parent_hash)
     }
 
     /// Batch fetches uncle headers and metadata using multi_get_cf.
@@ -472,7 +633,15 @@ impl Store {
         }
 
         let headers = self.get_share_headers(uncle_hashes).unwrap_or_default();
-        let metadata_pairs = self.get_block_metadata_batch(uncle_hashes);
+        // Uncle info only decorates a monitoring event, so a store failure
+        // costs display detail rather than correctness -- the same trade the
+        // header read above already makes. Logged so it is not silent.
+        let metadata_pairs = self
+            .get_block_metadata_batch(uncle_hashes)
+            .unwrap_or_else(|error| {
+                warn!("Could not read uncle metadata for monitoring: {error}");
+                Vec::new()
+            });
         let metadata_map: HashMap<BlockHash, _> = metadata_pairs
             .into_iter()
             .filter_map(|(hash, metadata)| Some((hash, metadata.expected_height?)))
@@ -483,7 +652,8 @@ impl Store {
             .map(|(blockhash, header)| UncleInfo {
                 blockhash,
                 prev_blockhash: header.prev_share_blockhash,
-                miner_address: header.miner_bitcoin_address.to_string(),
+                miner_bitcoin_address: header.miner_bitcoin_address.to_string(),
+                miner_address: header.miner_address,
                 timestamp: header.time,
                 height: metadata_map.get(&blockhash).copied(),
             })
@@ -540,7 +710,8 @@ impl Store {
                 blockhash: *blockhash,
                 prev_blockhash: header.prev_share_blockhash,
                 height: *height,
-                miner_address: header.miner_bitcoin_address.to_string(),
+                miner_bitcoin_address: header.miner_bitcoin_address.to_string(),
+                miner_address: header.miner_address,
                 timestamp: header.time,
                 bits: header.bits,
                 uncles,
@@ -606,6 +777,9 @@ impl Store {
 
     /// Batch fetches candidate share headers and returns ShareInfo entries
     /// ordered from highest height to lowest.
+    ///
+    /// Pruning deletes candidate index entries below the prune target, so
+    /// heights in that range are omitted.
     pub fn query_candidates(
         &self,
         from_height: u32,
@@ -629,28 +803,32 @@ impl Store {
         while height <= to_height {
             let blockhashes = self.get_blockhashes_for_height(height);
             for blockhash in &blockhashes {
-                let status = self
+                let (status, chain) = self
                     .get_block_metadata(blockhash)
-                    .map(|metadata| format!("{:?}", metadata.status))
-                    .unwrap_or_else(|_| "Unknown".to_string());
+                    .map(|metadata| (metadata.status.to_string(), metadata.chain.to_string()))
+                    .unwrap_or_else(|_| ("Unknown".to_string(), "Unknown".to_string()));
 
-                let (parent, uncles, miner_address) = match self.get_share_header(blockhash) {
-                    Ok(Some(header)) => (
-                        header.prev_share_blockhash,
-                        header.uncles.clone(),
-                        header.miner_bitcoin_address.to_string(),
-                    ),
-                    _ => (BlockHash::all_zeros(), vec![], "unknown".to_string()),
-                };
+                let (parent, uncles, miner_bitcoin_address, miner_address) =
+                    match self.get_share_header(blockhash) {
+                        Ok(Some(header)) => (
+                            header.prev_share_blockhash,
+                            header.uncles.clone(),
+                            header.miner_bitcoin_address.to_string(),
+                            Some(header.miner_address),
+                        ),
+                        _ => (BlockHash::all_zeros(), vec![], "unknown".to_string(), None),
+                    };
 
                 let has_block_data = self.share_block_exists(blockhash);
 
                 entries.push(DagEntry {
                     blockhash: *blockhash,
                     height,
-                    status,
+                    validation_status: status,
+                    chain,
                     parent,
                     uncles,
+                    miner_bitcoin_address,
                     miner_address,
                     has_block_data,
                 });
@@ -670,10 +848,18 @@ impl Store {
 pub struct DagEntry {
     pub blockhash: BlockHash,
     pub height: u32,
-    pub status: String,
+    /// Validation state only. Chain position is reported separately in `chain`.
+    pub validation_status: String,
+    pub chain: String,
     pub parent: BlockHash,
     pub uncles: Vec<BlockHash>,
-    pub miner_address: String,
+    pub miner_bitcoin_address: String,
+    /// Miner address, or `None` when the header could not be read.
+    ///
+    /// The witness program rather than the bech32m form: the store is network
+    /// agnostic, so the API and CLI layers render it.
+    #[serde(with = "p2poolv2_wallet::witness_program_codec::serde_hex_option")]
+    pub miner_address: Option<WitnessProgram>,
     pub has_block_data: bool,
 }
 
@@ -681,7 +867,9 @@ pub struct DagEntry {
 mod tests {
     use super::*;
     use crate::test_utils::TestShareBlockBuilder;
+    use crate::test_utils::make_test_share_program;
     use bitcoin::hashes::Hash;
+    use p2poolv2_wallet::witness_program_codec::to_hex;
     use tempfile::tempdir;
 
     #[test]
@@ -689,8 +877,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
 
-        // Create initial share
+        // Create initial share (genesis)
         let share1 = TestShareBlockBuilder::new().build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&share1, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
 
         // Create uncles for share2
         let uncle1_share2 = TestShareBlockBuilder::new()
@@ -714,24 +905,14 @@ mod tests {
             .prev_share_blockhash(share2.block_hash().to_string())
             .build();
 
-        let mut batch = rocksdb::WriteBatch::default();
-        // Add all shares to store
-        store.add_share_block(&share1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&uncle1_share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&uncle2_share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&share2, &mut batch).unwrap();
+        // Add all shares to store with valid metadata
+        store.store_with_valid_metadata(&uncle1_share2);
+        store.store_with_valid_metadata(&uncle2_share2);
+        store.store_with_valid_metadata(&share2);
         // Uncle block index updates are handled by organise_header, not
-        // add_share_block. Manually register uncle->nephew entries here
+        // store_with_valid_metadata. Manually register uncle->nephew entries here
         // since this test exercises the block index directly.
+        let mut batch = Store::get_write_batch();
         for uncle_blockhash in &share2.header.uncles {
             store
                 .update_block_index(uncle_blockhash, &share2.block_hash(), &mut batch)
@@ -739,10 +920,7 @@ mod tests {
         }
         store.commit_batch(batch).unwrap();
 
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&share3, &mut batch).unwrap();
-
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         // Verify children of share1
         let children_share1 = store
@@ -788,8 +966,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
 
-        // Create initial share
+        // Create initial share (genesis)
         let share1 = TestShareBlockBuilder::new().build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&share1, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
 
         // Create uncles for share2
         let uncle1_share2 = TestShareBlockBuilder::new()
@@ -813,24 +994,11 @@ mod tests {
             .prev_share_blockhash(share2.block_hash().to_string())
             .build();
 
-        let mut batch = rocksdb::WriteBatch::default();
-        // Add all shares to store
-        store.add_share_block(&share1, &mut batch).unwrap();
-        store.add_share_block(&uncle1_share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&uncle2_share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&share3, &mut batch).unwrap();
-
-        store.commit_batch(batch).unwrap();
+        // Add all shares to store with valid metadata
+        store.store_with_valid_metadata(&uncle1_share2);
+        store.store_with_valid_metadata(&uncle2_share2);
+        store.store_with_valid_metadata(&share2);
+        store.store_with_valid_metadata(&share3);
 
         // Verify descendants of share1
         let descendants_share1 = store
@@ -1853,9 +2021,7 @@ mod tests {
                 .nonce(0xe9695791 + i)
                 .build();
 
-            let mut batch = Store::get_write_batch();
-            store.add_share_block(&share, &mut batch).unwrap();
-            store.commit_batch(batch).unwrap();
+            store.store_with_valid_metadata(&share);
 
             blocks.push(share.block_hash());
             prev_hash = share.block_hash();
@@ -1903,25 +2069,19 @@ mod tests {
             .prev_share_blockhash(genesis.block_hash().to_string())
             .nonce(0xe9695792)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share1);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(0xe9695793)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .nonce(0xe9695794)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         // Test common ancestor of share3 and share2
         let ancestor = store
@@ -1968,25 +2128,19 @@ mod tests {
             .prev_share_blockhash(genesis.block_hash().to_string())
             .nonce(0xe9695792)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share1);
 
         let uncle1 = TestShareBlockBuilder::new()
             .prev_share_blockhash(genesis.block_hash().to_string())
             .nonce(0xe9695793)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(0xe9695794)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         // Test common ancestor of share2 and uncle1 (should be genesis)
         let ancestor = store
@@ -2062,26 +2216,20 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(100)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         // Create share2 - sibling of uncle1
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         // Create share3 with uncle1 as uncle (uncle1 is sibling of share3's parent)
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .uncles(vec![uncle1.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         // Get DAG from share3 with depth 10 (more than enough to include all blocks)
         let chain = store.get_dag_for_depth(&share3.block_hash(), 10).unwrap();
@@ -2129,32 +2277,24 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(100)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         let uncle2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(200)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle2);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .uncles(vec![uncle1.block_hash(), uncle2.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         let chain = store.get_dag_for_depth(&share3.block_hash(), 10).unwrap();
 
@@ -2203,43 +2343,33 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(100)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         // uncle2 is sibling of share3
         let uncle2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .nonce(200)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle2);
 
         // share3 has uncle1 as uncle (sibling of its parent share2)
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .uncles(vec![uncle1.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         // share4 has uncle2 as uncle (sibling of its parent share3)
         let share4 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share3.block_hash().to_string())
             .uncles(vec![uncle2.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share4, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share4);
 
         let chain = store.get_dag_for_depth(&share4.block_hash(), 10).unwrap();
 
@@ -2290,24 +2420,18 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(100)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .uncles(vec![uncle1.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         // With depth=2, we should get exactly 2 main chain blocks + uncles
         let chain = store.get_dag_for_depth(&share3.block_hash(), 2).unwrap();
@@ -2370,39 +2494,29 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(100)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         let uncle2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(200)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle2);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .uncles(vec![uncle1.block_hash(), uncle2.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         let share4 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share3.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share4, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share4);
 
         // With depth=2, we should get share4, share3 (main chain) + uncle1, uncle2
         let chain = store.get_dag_for_depth(&share4.block_hash(), 2).unwrap();
@@ -2455,40 +2569,30 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(100)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         let uncle2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .nonce(200)
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle2);
 
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .uncles(vec![uncle1.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         let share4 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share3.block_hash().to_string())
             .uncles(vec![uncle2.block_hash()])
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share4, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share4);
 
         // With depth=3, we should get share4, share3, share2 (main chain) + uncle2, uncle1
         let chain = store.get_dag_for_depth(&share4.block_hash(), 3).unwrap();
@@ -2530,30 +2634,22 @@ mod tests {
         let share2 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share2);
 
         let share3 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share2.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share3, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share3);
 
         let share4 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share3.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share4, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share4);
 
         let share5 = TestShareBlockBuilder::new()
             .prev_share_blockhash(share4.block_hash().to_string())
             .build();
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share5, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share5);
 
         // With depth=3, should get exactly 3 main chain blocks
         let chain = store.get_dag_for_depth(&share5.block_hash(), 3).unwrap();
@@ -2568,47 +2664,6 @@ mod tests {
 
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0], share5.block_hash());
-    }
-
-    #[test]
-    fn test_is_already_uncle_returns_false_for_new_block() {
-        let temp_dir = tempdir().unwrap();
-        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
-
-        let share = TestShareBlockBuilder::new().build();
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&share, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        // A share that has not been used as an uncle should return false
-        assert!(!store.is_already_uncle(&share.block_hash()));
-    }
-
-    #[test]
-    fn test_add_to_uncles_index_and_is_already_uncle() {
-        let temp_dir = tempdir().unwrap();
-        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
-
-        let uncle = TestShareBlockBuilder::new().nonce(100).build();
-        let nephew = TestShareBlockBuilder::new().nonce(200).build();
-
-        let mut batch = rocksdb::WriteBatch::default();
-        store.add_share_block(&uncle, &mut batch).unwrap();
-        store.add_share_block(&nephew, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
-
-        // Before adding to uncles index
-        assert!(!store.is_already_uncle(&uncle.block_hash()));
-
-        // Add uncle to uncles index
-        let mut batch = rocksdb::WriteBatch::default();
-        store
-            .add_to_uncles_index(&uncle.block_hash(), &nephew.block_hash(), &mut batch)
-            .unwrap();
-        store.commit_batch(batch).unwrap();
-
-        // After adding to uncles index
-        assert!(store.is_already_uncle(&uncle.block_hash()));
     }
 
     #[test]
@@ -2670,8 +2725,8 @@ mod tests {
         store.add_share_block(&share, &mut batch).unwrap();
         store.commit_batch(batch).unwrap();
 
-        // No confirmed blocks, should return error
-        let result = store.find_uncles().unwrap();
+        // The share has no ancestors, so there are no uncle candidates.
+        let result = store.find_uncles(&share.block_hash()).unwrap();
         assert!(result.is_empty());
     }
 
@@ -2700,7 +2755,7 @@ mod tests {
         store.push_to_confirmed_chain(&share2).unwrap();
 
         // No unconfirmed children exist, so find_uncles should return empty
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
         assert!(uncles.is_empty());
     }
 
@@ -2736,9 +2791,59 @@ mod tests {
         store.push_to_confirmed_chain(&share1).unwrap();
 
         // find_uncles should find uncle1
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
         assert_eq!(uncles.len(), 1);
         assert!(uncles.contains(&uncle1.block_hash()));
+    }
+
+    #[test]
+    fn test_find_uncles_excludes_header_only_blocks_without_body() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        // Build chain:
+        //   share0 (confirmed)
+        //   /    \
+        // share1  uncle_no_body (header only, no block body)
+        // (confirmed)
+
+        let share0 = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&share0, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(1)
+            .build();
+        let uncle_no_body = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(100)
+            .build();
+
+        // Store uncle with header and metadata only, no block body.
+        // Also write the parent->child block index so find_uncles
+        // discovers it via get_children_blockhashes.
+        store.create_valid_metadata_only(&uncle_no_body);
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_index(
+                &share0.block_hash(),
+                &uncle_no_body.block_hash(),
+                &mut batch,
+            )
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+        assert!(!store.share_block_exists(&uncle_no_body.block_hash()));
+
+        store.push_to_confirmed_chain(&share1).unwrap();
+
+        // find_uncles should NOT include the header-only uncle
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
+        assert!(
+            uncles.is_empty(),
+            "Header-only uncle without block body should not be selected"
+        );
     }
 
     #[test]
@@ -2803,7 +2908,7 @@ mod tests {
 
         // find_uncles should find uncle0, uncle1, uncle2
         // Sorted by chain_work descending: uncle2 (work=3), uncle1 (work=2), uncle0 (work=1)
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
         assert_eq!(uncles.len(), 3);
         // Verify order - highest chain_work first
         assert_eq!(uncles[0], uncle2.block_hash());
@@ -2877,25 +2982,479 @@ mod tests {
         // find_uncles from share5 (height 5)
         // Should only find uncle_within (at height 3, within depth 3: heights 2,3,4)
         // Should NOT find uncle_deep (at height 1, beyond the range we look at)
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
 
         assert_eq!(uncles.len(), 1);
         assert!(uncles.contains(&uncle_within.block_hash()));
         assert!(!uncles.contains(&uncle_deep.block_hash()));
     }
 
+    /// A block this node marked `Invalid` is never selected as an uncle: it
+    /// would pay PPLNS weight to a block we judged to break the rules. This is
+    /// selection only -- `validate_uncles` still accepts a peer's nephew that
+    /// references such a block, because uncle acceptance must not depend on
+    /// per-node validation progress.
     #[test]
-    fn test_find_uncles_excludes_already_used_uncles() {
+    fn test_find_uncles_excludes_invalid_and_keeps_header_valid() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let base = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(1)
+            .build();
+        store.push_to_confirmed_chain(&base).unwrap();
+
+        // Three siblings of base, off the confirmed chain: one left at
+        // HeaderValid, one marked BlockValid, one marked Invalid.
+        let header_valid = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(100)
+            .build();
+        store.store_with_valid_metadata(&header_valid);
+
+        let block_valid = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(101)
+            .build();
+        store.store_with_valid_metadata(&block_valid);
+
+        let invalid = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(102)
+            .build();
+        store.store_with_valid_metadata(&invalid);
+
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&block_valid.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .mark_invalid(&invalid.block_hash(), None, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let uncles = store.find_uncles(&base.block_hash()).unwrap();
+
+        assert!(
+            !uncles.contains(&invalid.block_hash()),
+            "an Invalid block must not be paid uncle weight"
+        );
+        assert!(
+            uncles.contains(&block_valid.block_hash()),
+            "a validated sibling is still an uncle"
+        );
+        assert!(
+            uncles.contains(&header_valid.block_hash()),
+            "an uncle needs a body, not chain-context validation"
+        );
+    }
+
+    /// `BlockIndex` stores uncle -> nephew edges under the same key as
+    /// parent -> child ones, so a nephew can be read back as a "child" of an
+    /// ancestor. A nephew sits at or above the new share's own height, and
+    /// `validate_uncle_positions` rejects such an uncle -- meaning the node
+    /// would mine a share its own organise worker marks Invalid.
+    /// An invalidated block hides its whole subtree: those descendants can
+    /// never be confirmed, because the candidate chain cannot reorg through an
+    /// Invalid ancestor. The cached pointer this search replaced kept naming
+    /// such a descendant, so the pool mined on a dead branch.
+    #[test]
+    fn test_find_best_block_valid_descendant_skips_invalid_subtree() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // c1 is validated, and x1 above it has more work.
+        let c1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(1)
+            .build();
+        store.store_with_valid_metadata(&c1);
+        let x1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c1.block_hash().to_string())
+            .nonce(2)
+            .build();
+        store.store_with_valid_metadata(&x1);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&c1.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .mark_block_valid(&x1.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert!(matches!(
+            store
+                .find_best_block_valid_descendant(&genesis.block_hash())
+                .unwrap(),
+            BlockValidSearch::Found(hash) if hash == x1.block_hash()
+        ));
+
+        // Invalidating c1 takes x1 out of reach even though x1 is untouched.
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_invalid(&c1.block_hash(), None, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            store.get_block_metadata(&x1.block_hash()).unwrap().status,
+            Status::BlockValid,
+            "x1 itself is still BlockValid; only its ancestor was invalidated"
+        );
+        assert!(matches!(
+            store
+                .find_best_block_valid_descendant(&genesis.block_hash())
+                .unwrap(),
+            BlockValidSearch::NotFound { visited: 1 }
+        ));
+    }
+
+    /// However many validated blocks sit above the confirmed tip, the search
+    /// returns the highest-work one, not the best of the blocks it happened to
+    /// reach first.
+    ///
+    /// A search that stops part-way returns the same shallow block on every
+    /// job refresh, so every share lands on one parent as a sibling, adds no
+    /// work, and builds a dense height.
+    #[test]
+    fn test_find_best_block_valid_descendant_finds_tip_beyond_many_validated_siblings() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // A validated chain c1 -> c2 -> c3 above genesis.
+        let c1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(1)
+            .build();
+        store.store_with_valid_metadata(&c1);
+        let c2 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c1.block_hash().to_string())
+            .nonce(2)
+            .build();
+        store.store_with_valid_metadata(&c2);
+        let c3 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c2.block_hash().to_string())
+            .nonce(3)
+            .build();
+        store.store_with_valid_metadata(&c3);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&c1.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .mark_block_valid(&c2.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .mark_block_valid(&c3.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // 1024 validated siblings of c1: with c1 that is 1025 blocks at the
+        // first level, more than a 1024-block search reaches before c2.
+        let mut batch = Store::get_write_batch();
+        for nonce in 4..1028 {
+            let sibling = TestShareBlockBuilder::new()
+                .prev_share_blockhash(genesis.block_hash().to_string())
+                .nonce(nonce)
+                .build();
+            store.store_with_valid_metadata(&sibling);
+            store
+                .mark_block_valid(&sibling.block_hash(), &mut batch)
+                .unwrap();
+        }
+        store.commit_batch(batch).unwrap();
+
+        assert!(matches!(
+            store
+                .find_best_block_valid_descendant(&genesis.block_hash())
+                .unwrap(),
+            BlockValidSearch::Found(hash) if hash == c3.block_hash()
+        ));
+    }
+
+    /// Header-only blocks cannot hide a validated block from the search.
+    ///
+    /// Validation is parent-gated, so no block below a header-only one is
+    /// validated and the search does not walk into it. A batch of synced
+    /// headers above the confirmed tip (a full response at a time) must not
+    /// stop the search from reaching our own validated chain.
+    #[test]
+    fn test_find_best_block_valid_descendant_skips_header_only_subtree() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // Our validated chain v1 -> v2.
+        let v1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(1)
+            .build();
+        store.store_with_valid_metadata(&v1);
+        let v2 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(v1.block_hash().to_string())
+            .nonce(2)
+            .build();
+        store.store_with_valid_metadata(&v2);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&v1.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .mark_block_valid(&v2.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // 1024 HeaderValid siblings of v1, never validated.
+        for nonce in 3..1027 {
+            let header_only = TestShareBlockBuilder::new()
+                .prev_share_blockhash(genesis.block_hash().to_string())
+                .nonce(nonce)
+                .build();
+            store.store_with_valid_metadata(&header_only);
+        }
+
+        assert!(matches!(
+            store
+                .find_best_block_valid_descendant(&genesis.block_hash())
+                .unwrap(),
+            BlockValidSearch::Found(hash) if hash == v2.block_hash()
+        ));
+    }
+
+    /// A validated block not on the candidate chain is still a mining base: this
+    /// is the normal state when the candidate chain has reorged onto a peer's
+    /// header-only fork and our own mined blocks are the only validated ones
+    /// above the confirmed tip.
+    #[test]
+    fn test_find_best_block_valid_descendant_finds_off_candidate_chain_block() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // A header-only block with more work, as header sync would leave it.
+        let header_only = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(1)
+            .work(8)
+            .build();
+        store.create_valid_metadata_only(&header_only);
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_index(&genesis.block_hash(), &header_only.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // Our own validated block, off the candidate chain and with less work.
+        let mined = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(2)
+            .work(1)
+            .build();
+        store.store_with_valid_metadata(&mined);
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&mined.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert!(matches!(
+            store
+                .find_best_block_valid_descendant(&genesis.block_hash())
+                .unwrap(),
+            BlockValidSearch::Found(hash) if hash == mined.block_hash()
+        ));
+    }
+
+    #[test]
+    fn test_find_uncles_excludes_nephew_read_as_child() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        // Confirmed chain, with a fork at height 2:
+        //
+        //   genesis(0) - a(1) - b(2) --- base(3)
+        //                  |        \
+        //                  |         sibling(3)
+        //                  |
+        //                  \ b_fork(2) - p(3) - nephew(4)
+        //                                          uncles b(2)
+        //
+        // nephew is a valid block: b is two below it and is not on its own
+        // ancestry (p, b_fork, a, genesis). But b IS an ancestor of base, so
+        // organising nephew's header files it under b in the block index, and
+        // a share mined on base would pick it up as an uncle at its own
+        // height.
+        let genesis = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(1)
+            .build();
+        store.push_to_confirmed_chain(&a).unwrap();
+
+        let b = TestShareBlockBuilder::new()
+            .prev_share_blockhash(a.block_hash().to_string())
+            .nonce(2)
+            .build();
+        store.push_to_confirmed_chain(&b).unwrap();
+
+        let base = TestShareBlockBuilder::new()
+            .prev_share_blockhash(b.block_hash().to_string())
+            .nonce(3)
+            .build();
+        store.push_to_confirmed_chain(&base).unwrap();
+
+        // Two genuine uncle candidates for a share mined on base: a sibling of
+        // base, and the head of the fork branch at height 2.
+        let sibling = TestShareBlockBuilder::new()
+            .prev_share_blockhash(b.block_hash().to_string())
+            .nonce(100)
+            .build();
+        store.store_with_valid_metadata(&sibling);
+
+        let b_fork = TestShareBlockBuilder::new()
+            .prev_share_blockhash(a.block_hash().to_string())
+            .nonce(101)
+            .build();
+        store.store_with_valid_metadata(&b_fork);
+
+        let p = TestShareBlockBuilder::new()
+            .prev_share_blockhash(b_fork.block_hash().to_string())
+            .nonce(102)
+            .build();
+        store.store_with_valid_metadata(&p);
+
+        let nephew = TestShareBlockBuilder::new()
+            .prev_share_blockhash(p.block_hash().to_string())
+            .uncles(vec![b.block_hash()])
+            .nonce(103)
+            .build();
+        store.store_with_valid_metadata(&nephew);
+
+        // Mirror what organise_header writes for a declared uncle.
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_index(&b.block_hash(), &nephew.block_hash(), &mut batch)
+            .unwrap();
+        store
+            .add_to_uncles_index(&b.block_hash(), &nephew.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // The nephew is reachable as a "child" of b and passes every other
+        // filter: off base's ancestry, unconfirmed, never itself used as an
+        // uncle, body present.
+        let children = store
+            .get_children_blockhashes(&b.block_hash())
+            .unwrap()
+            .unwrap();
+        assert!(children.contains(&nephew.block_hash()));
+
+        let uncles = store.find_uncles(&base.block_hash()).unwrap();
+        assert!(
+            !uncles.contains(&nephew.block_hash()),
+            "A nephew must never be selected as an uncle: it is not below the new share"
+        );
+        assert!(uncles.contains(&sibling.block_hash()));
+        assert!(uncles.contains(&b_fork.block_hash()));
+        assert_eq!(uncles.len(), 2);
+    }
+
+    #[test]
+    fn test_find_uncles_excludes_uncles_listed_by_ancestors() {
         let temp_dir = tempdir().unwrap();
         let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
 
         // Build chain:
         //   share0 (confirmed)
         //   /    \
-        // share1  uncle1 (not confirmed, but already used as uncle)
+        // share1  uncle1 (not confirmed, listed as uncle by share2)
         // (confirmed)
         //   |    \
         // share2  uncle2 (not confirmed, available)
+        // (confirmed, lists uncle1)
+
+        let share0 = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&share0, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(1)
+            .build();
+        let uncle1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(100)
+            .build();
+        let share2 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share1.block_hash().to_string())
+            .uncles(vec![uncle1.block_hash()])
+            .nonce(2)
+            .build();
+        let uncle2 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share1.block_hash().to_string())
+            .nonce(101)
+            .build();
+
+        // Confirm share1 first so uncle1 and uncle2 can find their parents
+        store.push_to_confirmed_chain(&share1).unwrap();
+        store.store_with_valid_metadata(&uncle1);
+        store.store_with_valid_metadata(&uncle2);
+
+        // Confirm share2
+        store.push_to_confirmed_chain(&share2).unwrap();
+
+        // find_uncles should only find uncle2: share2, an ancestor of the
+        // new share, already lists uncle1.
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
+        assert_eq!(uncles.len(), 1);
+        assert!(uncles.contains(&uncle2.block_hash()));
+        assert!(!uncles.contains(&uncle1.block_hash()));
+    }
+
+    /// An uncle listed only by a losing sibling nephew, off the base's
+    /// ancestry, is still available to the winning chain.
+    #[test]
+    fn test_find_uncles_includes_uncle_listed_only_off_chain() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        // Build chain:
+        //   share0 (confirmed)
+        //   /    \
+        // share1  uncle1 (not confirmed)
+        // (confirmed)
+        //   |    \
+        // share2  losing_nephew (not confirmed, lists uncle1)
         // (confirmed)
 
         let share0 = TestShareBlockBuilder::new().nonce(0).build();
@@ -2915,31 +3474,32 @@ mod tests {
             .prev_share_blockhash(share1.block_hash().to_string())
             .nonce(2)
             .build();
-        let uncle2 = TestShareBlockBuilder::new()
+        let losing_nephew = TestShareBlockBuilder::new()
             .prev_share_blockhash(share1.block_hash().to_string())
+            .uncles(vec![uncle1.block_hash()])
             .nonce(101)
             .build();
 
-        // Confirm share1 first so uncle1 and uncle2 can find their parents
         store.push_to_confirmed_chain(&share1).unwrap();
         store.store_with_valid_metadata(&uncle1);
-        store.store_with_valid_metadata(&uncle2);
-
-        // Confirm share2
+        store.store_with_valid_metadata(&losing_nephew);
         store.push_to_confirmed_chain(&share2).unwrap();
 
-        // Mark uncle1 as already used as uncle
+        // organise_header records every listed uncle in the uncles index,
+        // whichever branch the nephew is on.
         let mut batch = rocksdb::WriteBatch::default();
         store
-            .add_to_uncles_index(&uncle1.block_hash(), &share2.block_hash(), &mut batch)
+            .add_to_uncles_index(
+                &uncle1.block_hash(),
+                &losing_nephew.block_hash(),
+                &mut batch,
+            )
             .unwrap();
         store.commit_batch(batch).unwrap();
 
-        // find_uncles should only find uncle2, not uncle1
-        let uncles = store.find_uncles().unwrap();
-        assert_eq!(uncles.len(), 1);
-        assert!(uncles.contains(&uncle2.block_hash()));
-        assert!(!uncles.contains(&uncle1.block_hash()));
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
+        assert!(uncles.contains(&uncle1.block_hash()));
+        assert!(uncles.contains(&losing_nephew.block_hash()));
     }
 
     #[test]
@@ -2973,7 +3533,7 @@ mod tests {
         store.push_to_confirmed_chain(&share2).unwrap();
 
         // find_uncles should return empty - share1 is child of share0 but is confirmed
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
         assert!(uncles.is_empty());
     }
 
@@ -3038,22 +3598,124 @@ mod tests {
 
         // find_uncles should return exactly 3 uncles, prioritizing higher chain_work
         // uncle_d has work=2, uncle_a/b/c have default work=1
-        let uncles = store.find_uncles().unwrap();
-        assert_eq!(uncles.len(), 3);
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
 
-        // uncle_d should be first (highest chain_work)
-        assert_eq!(uncles[0], uncle_d.block_hash());
-
-        // The remaining 2 should be from uncle_a, uncle_b, uncle_c (all same chain_work)
-        let height_1_uncles: HashSet<BlockHash> = [
+        // uncle_d leads on chain_work. uncle_a/b/c tie behind it and only two
+        // of the three fit, so the blockhash tiebreak decides both which pair
+        // is kept and the order it is kept in.
+        let mut tied = [
             uncle_a.block_hash(),
             uncle_b.block_hash(),
             uncle_c.block_hash(),
-        ]
-        .into_iter()
-        .collect();
-        assert!(height_1_uncles.contains(&uncles[1]));
-        assert!(height_1_uncles.contains(&uncles[2]));
+        ];
+        tied.sort();
+        assert_eq!(uncles, vec![uncle_d.block_hash(), tied[0], tied[1]]);
+    }
+
+    /// Uncles of equal chain_work are ordered by blockhash ascending.
+    #[test]
+    fn test_find_uncles_orders_equal_work_uncles_by_blockhash() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        // share0 (confirmed, height 0)
+        //   /   |     |       \
+        // share1 uncle_a uncle_b uncle_c (height 1, all default work)
+        // (confirmed)
+        let share0 = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&share0, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(1)
+            .build();
+        let uncle_a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(100)
+            .build();
+        let uncle_b = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(101)
+            .build();
+        let uncle_c = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(102)
+            .build();
+
+        store.store_with_valid_metadata(&uncle_a);
+        store.store_with_valid_metadata(&uncle_b);
+        store.store_with_valid_metadata(&uncle_c);
+        store.push_to_confirmed_chain(&share1).unwrap();
+
+        let uncles = store.find_uncles(&share1.block_hash()).unwrap();
+
+        // Same parent and same work, so chain_work ties and only the blockhash
+        // separates them.
+        let mut expected = vec![
+            uncle_a.block_hash(),
+            uncle_b.block_hash(),
+            uncle_c.block_hash(),
+        ];
+        expected.sort();
+        assert_eq!(uncles, expected);
+    }
+
+    /// When more equal-work candidates exist than MAX_UNCLES, the blockhash
+    /// order decides which are kept, not just how the kept ones are arranged.
+    /// Without the tiebreak this selection differs between nodes.
+    #[test]
+    fn test_find_uncles_keeps_lowest_blockhashes_when_equal_work_exceeds_max() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        // share0 (confirmed, height 0)
+        //   /   |      |      |      \
+        // share1 uncle_a uncle_b uncle_c uncle_d (height 1, all default work)
+        // (confirmed)
+        let share0 = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&share0, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(1)
+            .build();
+        let uncle_a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(100)
+            .build();
+        let uncle_b = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(101)
+            .build();
+        let uncle_c = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(102)
+            .build();
+        let uncle_d = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share0.block_hash().to_string())
+            .nonce(103)
+            .build();
+
+        store.store_with_valid_metadata(&uncle_a);
+        store.store_with_valid_metadata(&uncle_b);
+        store.store_with_valid_metadata(&uncle_c);
+        store.store_with_valid_metadata(&uncle_d);
+        store.push_to_confirmed_chain(&share1).unwrap();
+
+        let uncles = store.find_uncles(&share1.block_hash()).unwrap();
+
+        let mut candidates = [
+            uncle_a.block_hash(),
+            uncle_b.block_hash(),
+            uncle_c.block_hash(),
+            uncle_d.block_hash(),
+        ];
+        candidates.sort();
+        assert_eq!(uncles.as_slice(), &candidates[..MAX_UNCLES]);
     }
 
     #[test]
@@ -3141,7 +3803,7 @@ mod tests {
         // - share4 (height 4) has children: share5, uncle5 -> uncle5 found
         // - share5 (height 5) has children: share6 only -> no uncles
         // uncle3 is NOT found because it's a child of share2 (height 2), which is outside the range
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
 
         assert_eq!(uncles.len(), 2);
         // Should be sorted by chain_work descending: uncle5 (work=2), uncle4 (work=1)
@@ -3152,6 +3814,82 @@ mod tests {
         assert!(!uncles.contains(&uncle1.block_hash()));
         assert!(!uncles.contains(&uncle2.block_hash()));
         assert!(!uncles.contains(&uncle3.block_hash()));
+    }
+
+    #[test]
+    fn test_find_uncles_anchors_on_leading_base_not_confirmed_tip() {
+        // Regression for the mining-base / uncle-altitude mismatch: when the
+        // mining base leads the confirmed tip on a BlockValid fork, uncles must
+        // be selected relative to the base (the nephew's parent), not the
+        // confirmed tip. Otherwise find_uncles returns blocks too deep for the
+        // nephew and the node's own share fails the uncle-depth check.
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        // Confirmed chain g(0) -> c1(1) -> c2(2) -> c3(3).
+        let g = TestShareBlockBuilder::new().nonce(0).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&g, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let c1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(g.block_hash().to_string())
+            .nonce(1)
+            .build();
+        // A sibling of c2 (child of c1) at height 2. Depth 4 from a nephew built
+        // on f5, so it must be excluded -- but confirmed-tip anchoring (tip c3)
+        // would have selected it.
+        let deep_uncle = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c1.block_hash().to_string())
+            .nonce(102)
+            .build();
+        let c2 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c1.block_hash().to_string())
+            .nonce(2)
+            .build();
+        let c3 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c2.block_hash().to_string())
+            .nonce(3)
+            .build();
+
+        store.push_to_confirmed_chain(&c1).unwrap();
+        store.store_with_valid_metadata(&deep_uncle);
+        store.push_to_confirmed_chain(&c2).unwrap();
+        store.push_to_confirmed_chain(&c3).unwrap();
+
+        // BlockValid fork leading the confirmed tip by 2: c3 -> f4(4) -> f5(5).
+        let f4 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c3.block_hash().to_string())
+            .nonce(4)
+            .build();
+        // A sibling of f4 (child of c3) at height 4. Depth 2 from a nephew built
+        // on f5, so it is a valid uncle.
+        let near_uncle = TestShareBlockBuilder::new()
+            .prev_share_blockhash(c3.block_hash().to_string())
+            .nonce(104)
+            .build();
+        let f5 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(f4.block_hash().to_string())
+            .nonce(5)
+            .build();
+        store.store_with_valid_metadata(&f4);
+        store.store_with_valid_metadata(&near_uncle);
+        store.store_with_valid_metadata(&f5);
+
+        // Anchored on the leading base f5 (the nephew would be at height 6).
+        let uncles = store.find_uncles(&f5.block_hash()).unwrap();
+
+        // The near sibling (depth 2) is a valid uncle.
+        assert!(
+            uncles.contains(&near_uncle.block_hash()),
+            "near sibling within MAX_UNCLES_DEPTH must be a uncle"
+        );
+        // The deep sibling (depth 4) is outside the base's window and must be
+        // excluded; confirmed-tip anchoring would have wrongly included it.
+        assert!(
+            !uncles.contains(&deep_uncle.block_hash()),
+            "sibling deeper than MAX_UNCLES_DEPTH from the base must be excluded"
+        );
     }
 
     /// Higher chain_work uncles at a lower height should be preferred
@@ -3219,18 +3957,13 @@ mod tests {
         // Confirm share2
         store.push_to_confirmed_chain(&share2).unwrap();
 
-        let uncles = store.find_uncles().unwrap();
-        assert_eq!(uncles.len(), 3);
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
 
-        // uncle_high (work=3) should come first
-        assert_eq!(uncles[0], uncle_high.block_hash());
-
-        // uncle_mid_a and uncle_mid_b (both work=2) should be selected over uncle_low (work=1)
-        let mid_uncles: HashSet<BlockHash> = [uncle_mid_a.block_hash(), uncle_mid_b.block_hash()]
-            .into_iter()
-            .collect();
-        assert!(mid_uncles.contains(&uncles[1]));
-        assert!(mid_uncles.contains(&uncles[2]));
+        // uncle_high (work=3) comes first, then uncle_mid_a and uncle_mid_b
+        // (both work=2) in blockhash order.
+        let mut tied = [uncle_mid_a.block_hash(), uncle_mid_b.block_hash()];
+        tied.sort();
+        assert_eq!(uncles, vec![uncle_high.block_hash(), tied[0], tied[1]]);
 
         // uncle_low at height 2 is excluded despite being at higher height than the mids
         assert!(!uncles.contains(&uncle_low.block_hash()));
@@ -3275,7 +4008,7 @@ mod tests {
         // Verify chain tip is share2
         assert_eq!(store.get_chain_tip().unwrap(), share2.block_hash());
 
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
 
         // fork_uncle should be found
         assert_eq!(uncles.len(), 1);
@@ -3294,7 +4027,8 @@ mod tests {
             blockhash: BlockHash::all_zeros(),
             prev_blockhash: BlockHash::all_zeros(),
             height: 42,
-            miner_address: "02aabbccdd".to_string(),
+            miner_bitcoin_address: "tb1q4axuxtvt0q6x4r7g8qjqmzfhkkw4tjgvjrxe7q".to_string(),
+            miner_address: make_test_share_program(1),
             timestamp: 1_700_000_000,
             bits: CompactTarget::from_consensus(0x1b4188f5),
             uncles: vec![],
@@ -3302,7 +4036,15 @@ mod tests {
 
         let json = serde_json::to_string(&share_info).unwrap();
         assert!(json.contains("\"height\":42"));
-        assert!(json.contains("\"miner_address\":\"02aabbccdd\""));
+        assert!(
+            json.contains(
+                "\"miner_bitcoin_address\":\"tb1q4axuxtvt0q6x4r7g8qjqmzfhkkw4tjgvjrxe7q\""
+            )
+        );
+        assert!(json.contains(&format!(
+            "\"miner_address\":\"{}\"",
+            to_hex(&make_test_share_program(1))
+        )));
         assert!(json.contains("\"timestamp\":1700000000"));
     }
 
@@ -3311,7 +4053,8 @@ mod tests {
         let uncle = UncleInfo {
             blockhash: BlockHash::all_zeros(),
             prev_blockhash: BlockHash::all_zeros(),
-            miner_address: "02uncle".to_string(),
+            miner_bitcoin_address: "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk".to_string(),
+            miner_address: make_test_share_program(2),
             timestamp: 1_700_000_010,
             height: Some(41),
         };
@@ -3320,14 +4063,15 @@ mod tests {
             blockhash: BlockHash::all_zeros(),
             prev_blockhash: BlockHash::all_zeros(),
             height: 42,
-            miner_address: "02parent".to_string(),
+            miner_bitcoin_address: "tb1q4axuxtvt0q6x4r7g8qjqmzfhkkw4tjgvjrxe7q".to_string(),
+            miner_address: make_test_share_program(1),
             timestamp: 1_700_000_020,
             bits: CompactTarget::from_consensus(0x1b4188f5),
             uncles: vec![uncle],
         };
 
         let json = serde_json::to_string(&share_info).unwrap();
-        assert!(json.contains("\"02uncle\""));
+        assert!(json.contains(&format!("\"{}\"", to_hex(&make_test_share_program(2)))));
         assert!(json.contains("\"height\":41"));
     }
 
@@ -3336,13 +4080,22 @@ mod tests {
         let uncle = UncleInfo {
             blockhash: BlockHash::all_zeros(),
             prev_blockhash: BlockHash::all_zeros(),
-            miner_address: "02aabb".to_string(),
+            miner_bitcoin_address: "tb1q4axuxtvt0q6x4r7g8qjqmzfhkkw4tjgvjrxe7q".to_string(),
+            miner_address: make_test_share_program(2),
             timestamp: 1_700_000_005,
             height: Some(10),
         };
 
         let json = serde_json::to_string(&uncle).unwrap();
-        assert!(json.contains("\"miner_address\":\"02aabb\""));
+        assert!(
+            json.contains(
+                "\"miner_bitcoin_address\":\"tb1q4axuxtvt0q6x4r7g8qjqmzfhkkw4tjgvjrxe7q\""
+            )
+        );
+        assert!(json.contains(&format!(
+            "\"miner_address\":\"{}\"",
+            to_hex(&make_test_share_program(2))
+        )));
         assert!(json.contains("\"timestamp\":1700000005"));
         assert!(json.contains("\"height\":10"));
     }
@@ -3352,7 +4105,8 @@ mod tests {
         let uncle = UncleInfo {
             blockhash: BlockHash::all_zeros(),
             prev_blockhash: BlockHash::all_zeros(),
-            miner_address: "02ccdd".to_string(),
+            miner_bitcoin_address: "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk".to_string(),
+            miner_address: make_test_share_program(2),
             timestamp: 1_700_000_005,
             height: None,
         };
@@ -3363,7 +4117,7 @@ mod tests {
 
     #[test]
     fn test_query_share_blocks_returns_blocks_in_order() {
-        use crate::store::block_tx_metadata::{BlockMetadata, Status};
+        use crate::store::block_tx_metadata::{BlockMetadata, ChainMembership, Status};
 
         let temp_dir = tempdir().unwrap();
         let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
@@ -3380,6 +4134,7 @@ mod tests {
                 expected_height: Some(height as u32),
                 chain_work: share.header.get_work(),
                 status: Status::HeaderValid,
+                chain: ChainMembership::None,
             };
             store
                 .update_block_metadata(&share.block_hash(), &metadata, &mut batch)
@@ -3404,7 +4159,7 @@ mod tests {
 
     #[test]
     fn test_query_share_blocks_returns_subset() {
-        use crate::store::block_tx_metadata::{BlockMetadata, Status};
+        use crate::store::block_tx_metadata::{BlockMetadata, ChainMembership, Status};
 
         let temp_dir = tempdir().unwrap();
         let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
@@ -3421,6 +4176,7 @@ mod tests {
                 expected_height: Some(height as u32),
                 chain_work: share.header.get_work(),
                 status: Status::HeaderValid,
+                chain: ChainMembership::None,
             };
             store
                 .update_block_metadata(&share.block_hash(), &metadata, &mut batch)
@@ -3558,26 +4314,26 @@ mod tests {
             share_b.block_hash(),
             genesis.block_hash(),
         ];
-        let result = store.first_known_for_locator(&locator);
+        let result = store.first_known_for_locator(&locator).unwrap();
         assert_eq!(result, Some(uncle.block_hash()));
 
         // Locator with only unknown entries returns None
         let locator = vec![unknown_hash];
-        let result = store.first_known_for_locator(&locator);
+        let result = store.first_known_for_locator(&locator).unwrap();
         assert_eq!(result, None);
 
         // Empty locator returns None
-        let result = store.first_known_for_locator(&[]);
+        let result = store.first_known_for_locator(&[]).unwrap();
         assert_eq!(result, None);
 
         // Locator with HeaderValid entry matches it
         let locator = vec![uncle.block_hash(), genesis.block_hash()];
-        let result = store.first_known_for_locator(&locator);
+        let result = store.first_known_for_locator(&locator).unwrap();
         assert_eq!(result, Some(uncle.block_hash()));
 
         // Locator with only confirmed entries returns the first one
         let locator = vec![share_a.block_hash(), genesis.block_hash()];
-        let result = store.first_known_for_locator(&locator);
+        let result = store.first_known_for_locator(&locator).unwrap();
         assert_eq!(result, Some(share_a.block_hash()));
     }
 
@@ -3597,7 +4353,8 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blockhash, genesis.block_hash());
         assert_eq!(entries[0].height, 0);
-        assert_eq!(entries[0].status, "Confirmed");
+        assert_eq!(entries[0].validation_status, "HeaderValid");
+        assert_eq!(entries[0].chain, "Confirmed");
         assert!(entries[0].has_block_data);
     }
 

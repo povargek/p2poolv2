@@ -1,33 +1,24 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::shares::share_block::ShareTransaction;
 use crate::shares::witness_commitment::{WITNESS_COMMITMENT_LENGTH, WitnessCommitment};
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::{Hash, HashEngine, sha256d};
-use bitcoin::{Address, Transaction, TxOut, WitnessMerkleNode, Wtxid, merkle_tree};
+use bitcoin::script::Builder;
+use bitcoin::{
+    BlockHash, ScriptBuf, Transaction, TxOut, WitnessMerkleNode, WitnessProgram, Wtxid, merkle_tree,
+};
 
 const SHARE_VALUE: u64 = 1; // 100_000_000 satoshi == 1 BTC == 1 share
 /// BIP141 witness commitment header: OP_RETURN, push 36, magic "aa21a9ed".
-const BIP141_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+pub(crate) const BIP141_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 /// Witness reserved value (BIP141): 32 zero bytes, stored as the sole
 /// witness stack item of the coinbase input.
 const WITNESS_RESERVED_VALUE: [u8; 32] = [0u8; 32];
 
-/// Create a coinbase transaction for the given bitcoin address.
+/// Create a coinbase transaction for the given share chain miner address.
 ///
 /// Builds a coinbase that pays the miner one share unit and embeds a
 /// BIP141 witness commitment covering the provided share transactions.
@@ -37,25 +28,58 @@ const WITNESS_RESERVED_VALUE: [u8; 32] = [0u8; 32];
 ///
 /// Also places the 32-byte witness reserved value on the coinbase input's
 /// witness stack so validators can recompute the commitment.
+///
+/// `weak_block_hash` is what makes this transaction unique per share, and it
+/// is the only thing that does. Every other input is the same for every share
+/// a miner produces for a given work notify.
+///
+/// Taking it here is only sound because the share commitment does *not* cover
+/// this transaction. It covers the non-coinbase transactions instead, via
+/// [`compute_witness_root`]. Putting the merkle root of the whole set back
+/// into the commitment would make this circular: the hash would depend on a
+/// coinbase that depends on the hash.
 pub fn build_sharechain_coinbase_transaction(
-    btcaddress: &Address,
+    miner_address: &WitnessProgram,
+    weak_block_hash: BlockHash,
     other_share_transactions: &[ShareTransaction],
 ) -> Transaction {
-    let script_pubkey = btcaddress.script_pubkey();
+    build_sharechain_coinbase_for_witness_root(
+        miner_address,
+        weak_block_hash,
+        compute_witness_root(other_share_transactions),
+    )
+}
+
+/// Build the share coinbase from the witness root of the other share
+/// transactions rather than the transactions themselves.
+///
+/// Every input is bound to the proof of work: `miner_address` and
+/// `share_witness_root` are digested into the share commitment, and the weak
+/// block hash is the proof of work itself. So a header alone determines its
+/// share coinbase, which is what lets the admission gate reject a body whose
+/// coinbase is not the one its header implies.
+pub fn build_sharechain_coinbase_for_witness_root(
+    miner_address: &WitnessProgram,
+    weak_block_hash: BlockHash,
+    share_witness_root: WitnessMerkleNode,
+) -> Transaction {
+    let script_pubkey = ScriptBuf::new_witness_program(miner_address);
 
     let payout_output = TxOut {
         value: bitcoin::Amount::from_int_btc(SHARE_VALUE),
         script_pubkey,
     };
 
-    let witness_commitment_output = build_witness_commitment_output(other_share_transactions);
+    let witness_commitment_output = build_witness_commitment_output(share_witness_root);
 
     let mut witness = bitcoin::Witness::new();
     witness.push(WITNESS_RESERVED_VALUE);
 
     let tx_in = bitcoin::TxIn {
         previous_output: bitcoin::OutPoint::null(),
-        script_sig: bitcoin::ScriptBuf::new(),
+        script_sig: Builder::new()
+            .push_slice(weak_block_hash.to_byte_array())
+            .into_script(),
         sequence: bitcoin::Sequence::MAX,
         witness,
     };
@@ -68,13 +92,10 @@ pub fn build_sharechain_coinbase_transaction(
     }
 }
 
-/// Build the BIP141 witness commitment output for a share coinbase.
-///
-/// The witness root is computed from wtxids of `other_share_transactions`,
-/// prepended with an all-zero wtxid standing in for the coinbase itself.
-fn build_witness_commitment_output(other_share_transactions: &[ShareTransaction]) -> TxOut {
-    let witness_root = compute_witness_root(other_share_transactions);
-    let commitment_hash = compute_commitment_hash(&witness_root, &WITNESS_RESERVED_VALUE);
+/// Build the BIP141 witness commitment output for a share coinbase from the
+/// witness root of the other share transactions.
+fn build_witness_commitment_output(share_witness_root: WitnessMerkleNode) -> TxOut {
+    let commitment_hash = compute_commitment_hash(&share_witness_root, &WITNESS_RESERVED_VALUE);
 
     let mut script_bytes = [0u8; WITNESS_COMMITMENT_LENGTH];
     script_bytes[..6].copy_from_slice(&BIP141_COMMITMENT_HEADER);
@@ -89,6 +110,21 @@ fn build_witness_commitment_output(other_share_transactions: &[ShareTransaction]
 
 /// Compute the BIP141 witness merkle root for a share block. The coinbase
 /// wtxid is replaced with all-zeros.
+///
+/// This is also the share commitment's binding of the share transactions. A
+/// wtxid covers the whole transaction, witness included, so one root binds
+/// both the txids and the witnesses: a peer cannot republish a share with its
+/// transactions swapped or their witnesses altered.
+///
+/// The commitment is fixed at notify time, before the miner hashes, so it can
+/// only cover what is known then. The share coinbase is not: it carries the
+/// weak block hash, which exists only once the work is done. Its leaf here is
+/// all zeros, and the coinbase itself is determined by the header (see
+/// [`build_sharechain_coinbase_for_witness_root`]).
+///
+/// Both the notify path and validation must call this one function: the value
+/// is hashed into the commitment, so two implementations that disagree would
+/// produce shares no peer accepts.
 pub(crate) fn compute_witness_root(
     other_share_transactions: &[ShareTransaction],
 ) -> WitnessMerkleNode {
@@ -119,16 +155,21 @@ pub(crate) fn compute_commitment_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::{CompressedPublicKey, Network};
+
+    /// A stand-in weak block hash. Real shares take this from their bitcoin
+    /// header; these tests only need it to be fixed so txids are stable.
+    pub(super) fn test_weak_block_hash() -> BlockHash {
+        BlockHash::from_byte_array([0x11; 32])
+    }
+
+    use crate::test_utils::make_test_share_program;
 
     #[test]
     fn test_create_share_block_coinbase_transaction() {
-        let pubkey = "020202020202020202020202020202020202020202020202020202020202020202"
-            .parse::<CompressedPublicKey>()
-            .unwrap();
-        let address = Address::p2wpkh(&pubkey, Network::Regtest);
+        let address = make_test_share_program(1);
 
-        let transaction = build_sharechain_coinbase_transaction(&address, &[]);
+        let transaction =
+            build_sharechain_coinbase_transaction(&address, test_weak_block_hash(), &[]);
 
         assert_eq!(transaction.version, bitcoin::transaction::Version::TWO);
         assert_eq!(transaction.lock_time, bitcoin::absolute::LockTime::ZERO);
@@ -139,7 +180,10 @@ mod tests {
 
         let output = &transaction.output[0];
         assert_eq!(output.value, bitcoin::Amount::from_int_btc(SHARE_VALUE));
-        assert_eq!(output.script_pubkey, address.script_pubkey());
+        assert_eq!(
+            output.script_pubkey,
+            ScriptBuf::new_witness_program(&address)
+        );
 
         let commitment_output = &transaction.output[1];
         assert_eq!(commitment_output.value, bitcoin::Amount::ZERO);
@@ -159,10 +203,7 @@ mod tests {
 
     #[test]
     fn test_create_share_block_coinbase_transaction_with_share_transactions() {
-        let pubkey = "020202020202020202020202020202020202020202020202020202020202020202"
-            .parse::<CompressedPublicKey>()
-            .unwrap();
-        let address = Address::p2wpkh(&pubkey, Network::Regtest);
+        let address = make_test_share_program(1);
 
         // Build two non-coinbase share transactions with distinct witnesses,
         // so each produces a different wtxid and contributes to the witness
@@ -212,20 +253,32 @@ mod tests {
         });
 
         let other_share_transactions = vec![first_share_transaction, second_share_transaction];
-        let transaction =
-            build_sharechain_coinbase_transaction(&address, &other_share_transactions);
+        let coinbase_transaction = build_sharechain_coinbase_transaction(
+            &address,
+            test_weak_block_hash(),
+            &other_share_transactions,
+        );
 
-        assert_eq!(transaction.version, bitcoin::transaction::Version::TWO);
-        assert_eq!(transaction.lock_time, bitcoin::absolute::LockTime::ZERO);
-        assert_eq!(transaction.input.len(), 1);
-        assert_eq!(transaction.output.len(), 2);
-        assert!(transaction.is_coinbase());
+        assert_eq!(
+            coinbase_transaction.version,
+            bitcoin::transaction::Version::TWO
+        );
+        assert_eq!(
+            coinbase_transaction.lock_time,
+            bitcoin::absolute::LockTime::ZERO
+        );
+        assert_eq!(coinbase_transaction.input.len(), 1);
+        assert_eq!(coinbase_transaction.output.len(), 2);
+        assert!(coinbase_transaction.is_coinbase());
 
-        let output = &transaction.output[0];
+        let output = &coinbase_transaction.output[0];
         assert_eq!(output.value, bitcoin::Amount::from_int_btc(SHARE_VALUE));
-        assert_eq!(output.script_pubkey, address.script_pubkey());
+        assert_eq!(
+            output.script_pubkey,
+            ScriptBuf::new_witness_program(&address)
+        );
 
-        let commitment_output = &transaction.output[1];
+        let commitment_output = &coinbase_transaction.output[1];
         assert_eq!(commitment_output.value, bitcoin::Amount::ZERO);
         assert_eq!(
             commitment_output.script_pubkey.len(),
@@ -247,14 +300,173 @@ mod tests {
 
         // Commitment must differ from the empty-transactions case, proving
         // the witness root actually covers the share transactions.
-        let empty_transaction = build_sharechain_coinbase_transaction(&address, &[]);
+        let empty_transaction =
+            build_sharechain_coinbase_transaction(&address, test_weak_block_hash(), &[]);
         assert_ne!(
             commitment_output.script_pubkey,
             empty_transaction.output[1].script_pubkey
         );
 
-        let witness_stack: Vec<_> = transaction.input[0].witness.iter().collect();
+        let witness_stack: Vec<_> = coinbase_transaction.input[0].witness.iter().collect();
         assert_eq!(witness_stack.len(), 1);
         assert_eq!(witness_stack[0], &WITNESS_RESERVED_VALUE);
+    }
+}
+
+#[cfg(test)]
+mod share_coinbase_tests {
+    use super::tests::test_weak_block_hash;
+    use super::*;
+    use crate::test_utils::make_test_share_program;
+
+    /// A non-coinbase share transaction spending a distinct outpoint, so it has
+    /// its own txid and moves the root.
+    fn share_transaction(previous_txid_byte: u8, value_sats: u64) -> ShareTransaction {
+        ShareTransaction(Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([previous_txid_byte; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(value_sats),
+                script_pubkey: ScriptBuf::new_witness_program(&make_test_share_program(2)),
+            }],
+        })
+    }
+
+    /// Two shares from one miner differ only
+    /// in the block they were found for, so without the weak block hash in the
+    /// coinbase they carry one txid and their share units collide on a single
+    /// outpoint -- a miner with ten thousand shares would hold one unit.
+    #[test]
+    fn two_shares_from_one_miner_have_different_coinbase_txids() {
+        let address = make_test_share_program(1);
+
+        let first = build_sharechain_coinbase_transaction(
+            &address,
+            BlockHash::from_byte_array([0xaa; 32]),
+            &[],
+        );
+        let second = build_sharechain_coinbase_transaction(
+            &address,
+            BlockHash::from_byte_array([0xbb; 32]),
+            &[],
+        );
+
+        assert_ne!(first.compute_txid(), second.compute_txid());
+    }
+
+    /// Reconstruction during validation has to land on the same bytes, so the
+    /// same inputs must always give the same transaction.
+    #[test]
+    fn coinbase_is_deterministic_for_the_same_inputs() {
+        let address = make_test_share_program(1);
+        assert_eq!(
+            build_sharechain_coinbase_transaction(&address, test_weak_block_hash(), &[]),
+            build_sharechain_coinbase_transaction(&address, test_weak_block_hash(), &[])
+        );
+    }
+
+    /// Two miners must never produce interchangeable coinbases, or either could
+    /// claim the other's share unit.
+    #[test]
+    fn different_miners_give_different_coinbase_txids() {
+        let first = build_sharechain_coinbase_transaction(
+            &make_test_share_program(1),
+            test_weak_block_hash(),
+            &[],
+        );
+        let second = build_sharechain_coinbase_transaction(
+            &make_test_share_program(2),
+            test_weak_block_hash(),
+            &[],
+        );
+
+        assert_ne!(first.compute_txid(), second.compute_txid());
+    }
+
+    /// The coinbase commits to the other transactions through its BIP141
+    /// witness commitment output, so its own txid moves when they change.
+    #[test]
+    fn coinbase_txid_depends_on_the_other_transactions() {
+        let address = make_test_share_program(1);
+        let alone = build_sharechain_coinbase_transaction(&address, test_weak_block_hash(), &[]);
+        let with_transaction = build_sharechain_coinbase_transaction(
+            &address,
+            test_weak_block_hash(),
+            &[share_transaction(0x11, 1_000)],
+        );
+
+        assert_ne!(alone.compute_txid(), with_transaction.compute_txid());
+    }
+
+    /// A share block carries only its coinbase today, so this is the value the
+    /// commitment actually digests on every share: the root of the lone
+    /// all-zeros coinbase leaf.
+    #[test]
+    fn witness_root_is_all_zeros_without_share_transactions() {
+        assert_eq!(
+            compute_witness_root(&[]),
+            WitnessMerkleNode::from_raw_hash(Hash::all_zeros())
+        );
+    }
+
+    #[test]
+    fn adding_a_share_transaction_changes_the_witness_root() {
+        assert_ne!(
+            compute_witness_root(&[]),
+            compute_witness_root(&[share_transaction(0x11, 1_000)])
+        );
+    }
+
+    /// Order is part of what the commitment binds: two blocks with the same
+    /// transactions in a different order are different blocks.
+    #[test]
+    fn transaction_order_changes_the_witness_root() {
+        let first = share_transaction(0x11, 1_000);
+        let second = share_transaction(0x22, 2_000);
+
+        assert_ne!(
+            compute_witness_root(&[first.clone(), second.clone()]),
+            compute_witness_root(&[second, first])
+        );
+    }
+
+    /// A transaction's witness is bound too: altering it leaves the txid alone
+    /// but changes the wtxid, and with it the root.
+    #[test]
+    fn changing_a_witness_changes_the_witness_root() {
+        let original = share_transaction(0x11, 1_000);
+        let mut altered = original.clone();
+        altered.0.input[0].witness.push([0x42u8; 4]);
+
+        assert_eq!(original.compute_txid(), altered.compute_txid());
+        assert_ne!(
+            compute_witness_root(&[original]),
+            compute_witness_root(&[altered])
+        );
+    }
+
+    /// The share coinbase built from the transactions and the one built from
+    /// their witness root are the same transaction.
+    #[test]
+    fn coinbase_from_witness_root_matches_coinbase_from_transactions() {
+        let address = make_test_share_program(1);
+        let transactions = [share_transaction(0x11, 1_000)];
+        assert_eq!(
+            build_sharechain_coinbase_transaction(&address, test_weak_block_hash(), &transactions),
+            build_sharechain_coinbase_for_witness_root(
+                &address,
+                test_weak_block_hash(),
+                compute_witness_root(&transactions)
+            )
+        );
     }
 }

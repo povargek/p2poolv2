@@ -1,20 +1,10 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::accounting::payout::simple_pplns::share_worker::PplnsShareSender;
 use crate::accounting::stats::metrics;
+use crate::address::Address as P2PoolAddress;
 pub use crate::config::PoolMode;
 use crate::shares::chain::chain_store_handle::ChainStoreHandle;
 #[cfg(not(test))]
@@ -30,7 +20,6 @@ use crate::stratum::message_handlers::handle_message;
 use crate::stratum::messages::{Request, Response};
 use crate::stratum::session::Session;
 use crate::stratum::session_timeout::{self, check_session_timeouts};
-use crate::stratum::work::notify::NotifySender;
 use crate::stratum::work::prepared_notify::{PreparedNotifyParams, build_notify_from_prepared};
 use crate::stratum::work::tracker::JobTracker;
 use crate::utils::time_provider::{SystemTimeProvider, TimeProvider};
@@ -59,9 +48,12 @@ pub struct StratumServer {
     pub max_connections: Option<u32>,
     pub wait_for_chain_sync: bool,
     pub mode: PoolMode,
+    /// Pool wide share chain address from `[stratum] miner_address`, if set.
+    pub miner_address: Option<P2PoolAddress>,
     shutdown_rx: oneshot::Receiver<()>,
     connections_handle: ClientConnectionsHandle,
     emissions_tx: EmissionSender,
+    pplns_shares_tx: PplnsShareSender,
     chain_store_handle: ChainStoreHandle,
 }
 
@@ -82,9 +74,11 @@ pub struct StratumServerBuilder {
     shutdown_rx: Option<oneshot::Receiver<()>>,
     connections_handle: Option<ClientConnectionsHandle>,
     emissions_tx: Option<EmissionSender>,
+    pplns_shares_tx: Option<PplnsShareSender>,
     zmqpubhashblock: Option<String>,
     chain_store_handle: Option<ChainStoreHandle>,
     mode: Option<PoolMode>,
+    miner_address: Option<P2PoolAddress>,
 }
 
 impl StratumServerBuilder {
@@ -158,6 +152,11 @@ impl StratumServerBuilder {
         self
     }
 
+    pub fn pplns_shares_tx(mut self, pplns_shares_tx: PplnsShareSender) -> Self {
+        self.pplns_shares_tx = Some(pplns_shares_tx);
+        self
+    }
+
     pub fn zmqpubhashblock(mut self, zmqpubhashblock: String) -> Self {
         self.zmqpubhashblock = Some(zmqpubhashblock);
         self
@@ -170,6 +169,11 @@ impl StratumServerBuilder {
 
     pub fn mode(mut self, mode: PoolMode) -> Self {
         self.mode = Some(mode);
+        self
+    }
+
+    pub fn miner_address(mut self, miner_address: Option<P2PoolAddress>) -> Self {
+        self.miner_address = miner_address;
         self
     }
 
@@ -195,9 +199,11 @@ impl StratumServerBuilder {
                 .connections_handle
                 .ok_or("connections_handle is required")?,
             emissions_tx: self.emissions_tx.ok_or("shares_tx is required")?,
+            pplns_shares_tx: self.pplns_shares_tx.ok_or("pplns_shares_tx is required")?,
             max_connections: self.max_connections.unwrap_or(None),
             wait_for_chain_sync: self.wait_for_chain_sync.unwrap_or(true),
             mode: self.mode.unwrap_or_default(),
+            miner_address: self.miner_address,
             chain_store_handle: self
                 .chain_store_handle
                 .ok_or("chain store handle is required")?,
@@ -245,7 +251,6 @@ impl StratumServer {
     pub async fn start(
         &mut self,
         ready_tx: Option<oneshot::Sender<()>>,
-        notify_tx: NotifySender,
         tracker_handle: Arc<JobTracker>,
         bitcoinrpc_config: BitcoinRpcConfig,
         metrics: metrics::MetricsHandle,
@@ -259,10 +264,9 @@ impl StratumServer {
             &bitcoinrpc_config.password,
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send> {
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to create BitcoindRpcClient: {}", e),
-            ))
+            Box::new(std::io::Error::other(format!(
+                "Failed to create BitcoindRpcClient: {e}"
+            )))
         })?;
 
         if !wait_for_chain_sync(
@@ -307,7 +311,6 @@ impl StratumServer {
                             match connection_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => {
                                     let ctx = StratumContext {
-                                        notify_tx: notify_tx.clone(),
                                         tracker_handle: tracker_handle.clone(),
                                         bitcoindrpc_client: bitcoindrpc_client.clone(),
                                         start_difficulty: self.start_difficulty,
@@ -316,10 +319,12 @@ impl StratumServer {
                                         ignore_difficulty: self.ignore_difficulty,
                                         validate_addresses: self.validate_addresses,
                                         emissions_tx: self.emissions_tx.clone(),
+                                        pplns_shares_tx: self.pplns_shares_tx.clone(),
                                         network: self.network,
                                         metrics: metrics.clone(),
                                         chain_store_handle: self.chain_store_handle.clone(),
                                         mode: self.mode,
+                                        miner_address: self.miner_address,
                                     };
                                     accept_connection(
                                         stream,
@@ -420,8 +425,10 @@ async fn accept_connection(
 /// A context for the Stratum server easing the number of parameters passed around.
 #[derive(Clone)]
 pub(crate) struct StratumContext {
-    pub notify_tx: NotifySender,
     pub tracker_handle: Arc<JobTracker>,
+    /// Only read to submit a found bitcoin block, a path the `sim` feature
+    /// compiles out. See handle_submit in stratum/message_handlers/submit.rs.
+    #[cfg_attr(feature = "sim", allow(dead_code))]
     pub bitcoindrpc_client: BitcoindRpcClient,
     pub start_difficulty: u64,
     pub minimum_difficulty: u64,
@@ -429,10 +436,16 @@ pub(crate) struct StratumContext {
     pub ignore_difficulty: bool,
     pub validate_addresses: bool,
     pub emissions_tx: EmissionSender,
+    /// Hydrapool PPLNS shares go here, never through `emissions_tx`.
+    pub pplns_shares_tx: PplnsShareSender,
     pub network: bitcoin::network::Network,
     pub metrics: metrics::MetricsHandle,
     pub chain_store_handle: ChainStoreHandle,
     pub mode: PoolMode,
+    /// Pool wide share chain address from `[stratum] miner_address`, when the
+    /// operator configured one. Every share then carries it as its miner
+    /// address, and a miner sending a different `p2p=` is rejected at authorize.
+    pub miner_address: Option<P2PoolAddress>,
 }
 
 /// Handles a single connection to the Stratum server.  This function
@@ -442,6 +455,7 @@ pub(crate) struct StratumContext {
 /// Handling new notify on new templates. Watches for new prepared
 /// templates via the watch channel and builds per-miner notify
 /// messages.
+#[allow(clippy::too_many_arguments)] // wiring constructor: each parameter is a distinct collaborator, a params struct would only move the list
 async fn handle_connection<R, W, T: TimeProvider>(
     reader: R,
     mut writer: W,
@@ -487,13 +501,20 @@ where
             // Clone inside a block to ensure the watch Ref guard is dropped before await
             let prepared_template = { template_rx.borrow_and_update().clone() };
             if let Some(prepared) = prepared_template {
-                let commitment_address = if is_hydrapool {
-                    None
+                let (commitment_address, share_address) = if is_hydrapool {
+                    (None, None)
                 } else {
-                    session.parsed_address.as_ref()
+                    (
+                        session.parsed_address.as_ref(),
+                        session.miner_address.as_ref(),
+                    )
                 };
-                match build_notify_from_prepared(&prepared, commitment_address, &ctx.tracker_handle)
-                {
+                match build_notify_from_prepared(
+                    &prepared,
+                    commitment_address,
+                    share_address,
+                    &ctx.tracker_handle,
+                ) {
                     Ok(notify_json) => {
                         debug!("Sending first notify after authorize");
                         if let Err(e) = writer
@@ -536,12 +557,12 @@ where
                 if session.username.is_none() {
                     // Not yet authorized, skip building notify
                 } else if let Some(prepared) = prepared_template {
-                    let commitment_address = if is_hydrapool {
-                        None
+                    let (commitment_address, share_address) = if is_hydrapool {
+                        (None, None)
                     } else {
-                        session.parsed_address.as_ref()
+                        (session.parsed_address.as_ref(), session.miner_address.as_ref())
                     };
-                    match build_notify_from_prepared(&prepared, commitment_address, &ctx.tracker_handle) {
+                    match build_notify_from_prepared(&prepared, commitment_address, share_address, &ctx.tracker_handle) {
                         Ok(notify_json) => {
                             debug!("Send notify in reponse to new template");
                             if let Err(e) = writer.write_all(format!("{notify_json}\n").as_bytes()).await {
@@ -673,9 +694,11 @@ mod stratum_server_tests {
     use crate::stratum::messages::SimpleRequest;
     use crate::stratum::server;
     use crate::stratum::work::tracker::start_tracker_actor;
+    use crate::test_utils::make_test_share_address;
     use crate::test_utils::{TestShareBlockBuilder, setup_test_chain_store_handle};
     use crate::utils::time_provider::TestTimeProvider;
     use bitcoindrpc::test_utils::setup_mock_bitcoin_rpc;
+    use p2poolv2_config::DEFAULT_VERSION_MASK;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -687,6 +710,7 @@ mod stratum_server_tests {
         let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         let (shares_tx, _shares_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -710,10 +734,11 @@ mod stratum_server_tests {
             .minimum_difficulty(1)
             .maximum_difficulty(Some(2))
             .network(bitcoin::network::Network::Regtest)
-            .version_mask(0x1fffe000)
+            .version_mask(DEFAULT_VERSION_MASK)
             .shutdown_rx(shutdown_rx)
             .connections_handle(connections_handle)
             .emissions_tx(shares_tx)
+            .pplns_shares_tx(pplns_shares_tx)
             .chain_store_handle(chain_store_handle)
             .build()
             .await
@@ -724,7 +749,6 @@ mod stratum_server_tests {
         assert_eq!(server.hostname, "127.0.0.1");
 
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let (_template_tx, template_rx) = watch::channel(None);
 
         // Start the server in a separate task so we can shut it down
@@ -733,7 +757,6 @@ mod stratum_server_tests {
             let _ = server
                 .start(
                     Some(ready_tx),
-                    notify_tx,
                     tracker_handle.clone(),
                     bitcoinrpc_config,
                     metrics_handle,
@@ -769,9 +792,9 @@ mod stratum_server_tests {
         let mut writer = Vec::new();
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -780,7 +803,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -795,9 +817,11 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
+            pplns_shares_tx,
             network: bitcoin::network::Network::Regtest,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Run the handler
@@ -808,7 +832,7 @@ mod stratum_server_tests {
             addr,
             message_rx,
             shutdown_rx,
-            0x1fffe000,
+            DEFAULT_VERSION_MASK,
             ctx,
             &SystemTimeProvider {},
             template_rx,
@@ -891,10 +915,10 @@ mod stratum_server_tests {
         let mut writer = Vec::new();
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -903,7 +927,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -918,9 +941,11 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
+            pplns_shares_tx,
             network: bitcoin::network::Network::Regtest,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Run the handler
@@ -931,7 +956,7 @@ mod stratum_server_tests {
             addr,
             message_rx,
             shutdown_rx,
-            0x1fffe000,
+            DEFAULT_VERSION_MASK,
             ctx,
             &SystemTimeProvider {},
             template_rx,
@@ -975,10 +1000,10 @@ mod stratum_server_tests {
         let mut writer = Vec::new();
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -987,7 +1012,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1001,10 +1025,12 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
+            pplns_shares_tx,
             metrics: metrics_handle,
             network: bitcoin::network::Network::Regtest,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Run the handler
@@ -1015,7 +1041,7 @@ mod stratum_server_tests {
             addr,
             message_rx,
             shutdown_rx,
-            0x1fffe000,
+            DEFAULT_VERSION_MASK,
             ctx,
             &SystemTimeProvider {},
             template_rx,
@@ -1057,10 +1083,10 @@ mod stratum_server_tests {
         let mut writer = Vec::new();
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -1069,7 +1095,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1083,10 +1108,12 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
+            pplns_shares_tx,
             network: bitcoin::network::Network::Regtest,
             metrics: metrics_handle,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Run the handler
@@ -1097,7 +1124,7 @@ mod stratum_server_tests {
             addr,
             message_rx,
             shutdown_rx,
-            0x1fffe000,
+            DEFAULT_VERSION_MASK,
             ctx,
             &SystemTimeProvider {},
             template_rx,
@@ -1159,10 +1186,9 @@ mod stratum_server_tests {
 
         let mut writer = Vec::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8082);
-
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -1171,7 +1197,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1185,10 +1210,12 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
-            network: bitcoin::network::Network::Testnet,
+            pplns_shares_tx,
+            network: bitcoin::network::Network::Testnet4,
             metrics: metrics_handle,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Spawn the handler in a separate task
@@ -1202,7 +1229,7 @@ mod stratum_server_tests {
                 addr,
                 message_rx,
                 shutdown_rx,
-                0x1fffe000,
+                DEFAULT_VERSION_MASK,
                 ctx,
                 &SystemTimeProvider {},
                 template_rx,
@@ -1281,9 +1308,9 @@ mod stratum_server_tests {
 
         let mut writer = Vec::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8082);
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -1292,7 +1319,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1306,10 +1332,12 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
+            pplns_shares_tx,
             network: bitcoin::network::Network::Regtest,
             metrics: metrics_handle,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Spawn the handler in a separate task
@@ -1323,7 +1351,7 @@ mod stratum_server_tests {
                 addr,
                 message_rx,
                 shutdown_rx,
-                0x1fffe000,
+                DEFAULT_VERSION_MASK,
                 ctx,
                 &SystemTimeProvider {},
                 template_rx,
@@ -1390,10 +1418,10 @@ mod stratum_server_tests {
             let mut writer = Vec::new();
             let (_, message_rx) = mpsc::channel(10);
             let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-            let (notify_tx, _notify_rx) = mpsc::channel(10);
             let tracker_handle = start_tracker_actor();
             let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
             let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+            let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
             let stats_dir = tempfile::tempdir().unwrap();
             let metrics_handle =
                 metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
@@ -1403,7 +1431,6 @@ mod stratum_server_tests {
             let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(false).await;
 
             let ctx = StratumContext {
-                notify_tx,
                 tracker_handle: tracker_handle.clone(),
                 bitcoindrpc_client: BitcoindRpcClient::new(
                     &bitcoinrpc_config.url,
@@ -1418,9 +1445,11 @@ mod stratum_server_tests {
                 ignore_difficulty: false,
                 validate_addresses: true,
                 emissions_tx,
+                pplns_shares_tx,
                 network: bitcoin::network::Network::Regtest,
                 chain_store_handle,
                 mode: PoolMode::P2poolv2,
+                miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
             };
 
             // wait for subscribe/authorize messages
@@ -1440,7 +1469,7 @@ mod stratum_server_tests {
                     addr,
                     message_rx,
                     shutdown_rx,
-                    0x1fffe000,
+                    DEFAULT_VERSION_MASK,
                     ctx,
                     &time_provider,
                     template_rx,
@@ -1473,10 +1502,10 @@ mod stratum_server_tests {
             let mut writer = Vec::new();
             let (_, message_rx) = mpsc::channel(10);
             let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-            let (notify_tx, _notify_rx) = mpsc::channel(10);
             let tracker_handle = start_tracker_actor();
             let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
             let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+            let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
             let stats_dir = tempfile::tempdir().unwrap();
             let metrics_handle =
                 metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
@@ -1486,7 +1515,6 @@ mod stratum_server_tests {
             let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(false).await;
 
             let ctx = StratumContext {
-                notify_tx,
                 tracker_handle: tracker_handle.clone(),
                 bitcoindrpc_client: BitcoindRpcClient::new(
                     &bitcoinrpc_config.url,
@@ -1501,9 +1529,11 @@ mod stratum_server_tests {
                 ignore_difficulty: false,
                 validate_addresses: true,
                 emissions_tx,
+                pplns_shares_tx,
                 network: bitcoin::network::Network::Signet,
                 chain_store_handle,
                 mode: PoolMode::P2poolv2,
+                miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
             };
 
             let subscribe_message =
@@ -1536,7 +1566,7 @@ mod stratum_server_tests {
                     addr,
                     message_rx,
                     shutdown_rx,
-                    0x1fffe000,
+                    DEFAULT_VERSION_MASK,
                     ctx,
                     &time_provider,
                     template_rx,
@@ -1580,7 +1610,6 @@ mod stratum_server_tests {
         let prepared =
             PreparedNotifyParamsBuilder::new(template, output_distribution, b"test_pool", false)
                 .bits(CompactTarget::from_consensus(0x1d00ffff))
-                .time(1700000000u32)
                 .build()
                 .expect("PreparedNotifyParamsBuilder::build should succeed");
 
@@ -1615,10 +1644,9 @@ mod stratum_server_tests {
 
         let mut writer = Vec::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8090);
-
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -1627,7 +1655,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1642,9 +1669,11 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
-            network: bitcoin::network::Network::Testnet,
+            pplns_shares_tx,
+            network: bitcoin::network::Network::Testnet4,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Pre-load a template before starting handle_connection
@@ -1659,7 +1688,7 @@ mod stratum_server_tests {
                 addr,
                 message_rx,
                 shutdown_rx,
-                0x1fffe000,
+                DEFAULT_VERSION_MASK,
                 ctx,
                 &SystemTimeProvider {},
                 template_rx,
@@ -1745,10 +1774,9 @@ mod stratum_server_tests {
 
         let mut writer = Vec::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8091);
-
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -1757,7 +1785,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1772,9 +1799,11 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
-            network: bitcoin::network::Network::Testnet,
+            pplns_shares_tx,
+            network: bitcoin::network::Network::Testnet4,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         // Start with no template - will send one after authorization
@@ -1788,7 +1817,7 @@ mod stratum_server_tests {
                 addr,
                 message_rx,
                 shutdown_rx,
-                0x1fffe000,
+                DEFAULT_VERSION_MASK,
                 ctx,
                 &SystemTimeProvider {},
                 template_rx,
@@ -1885,10 +1914,9 @@ mod stratum_server_tests {
 
         let mut writer = Vec::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8092);
-
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let tracker_handle = start_tracker_actor();
         let (emissions_tx, _emissions_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -1897,7 +1925,6 @@ mod stratum_server_tests {
         let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
 
         let ctx = StratumContext {
-            notify_tx,
             tracker_handle: tracker_handle.clone(),
             bitcoindrpc_client: BitcoindRpcClient::new(
                 &bitcoinrpc_config.url,
@@ -1912,9 +1939,11 @@ mod stratum_server_tests {
             ignore_difficulty: false,
             validate_addresses: true,
             emissions_tx,
+            pplns_shares_tx,
             network: bitcoin::network::Network::Regtest,
             chain_store_handle,
             mode: PoolMode::P2poolv2,
+            miner_address: Some(make_test_share_address(1, bitcoin::Network::Testnet4)),
         };
 
         let (template_tx, template_rx) = watch::channel(None);
@@ -1927,7 +1956,7 @@ mod stratum_server_tests {
                 addr,
                 message_rx,
                 shutdown_rx,
-                0x1fffe000,
+                DEFAULT_VERSION_MASK,
                 ctx,
                 &SystemTimeProvider {},
                 template_rx,
@@ -1986,6 +2015,7 @@ mod stratum_server_tests {
         let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         let (shares_tx, _shares_rx) = mpsc::channel(10);
+        let (pplns_shares_tx, _pplns_shares_rx) = mpsc::channel(10);
         let stats_dir = tempfile::tempdir().unwrap();
         let metrics_handle = metrics::start_metrics(stats_dir.path().to_str().unwrap().to_string())
             .await
@@ -2023,11 +2053,12 @@ mod stratum_server_tests {
             .minimum_difficulty(1)
             .maximum_difficulty(Some(2))
             .network(bitcoin::network::Network::Regtest)
-            .version_mask(0x1fffe000)
+            .version_mask(DEFAULT_VERSION_MASK)
             .max_connections(Some(1))
             .shutdown_rx(shutdown_rx)
             .connections_handle(connections_handle)
             .emissions_tx(shares_tx)
+            .pplns_shares_tx(pplns_shares_tx)
             .chain_store_handle(chain_store_handle)
             .build()
             .await
@@ -2036,14 +2067,12 @@ mod stratum_server_tests {
         assert_eq!(server.max_connections, Some(1));
 
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = mpsc::channel(10);
         let (_template_tx, template_rx) = watch::channel(None);
 
         let server_handle = tokio::spawn(async move {
             let _ = server
                 .start(
                     Some(ready_tx),
-                    notify_tx,
                     tracker_handle.clone(),
                     bitcoinrpc_config,
                     metrics_handle,
@@ -2075,8 +2104,8 @@ mod stratum_server_tests {
             .await;
 
             match read_result {
-                _ => {
-                    // was not serviced
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+                    // EOF, read error or timeout: the connection was not serviced
                 }
                 Ok(Ok(_)) => {
                     panic!("Second connection should not receive data when at max capacity");

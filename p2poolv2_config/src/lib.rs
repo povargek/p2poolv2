@@ -1,25 +1,17 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bitcoin::address::NetworkChecked;
 use bitcoin::{Address, Network};
 use bitcoindrpc::BitcoinRpcConfig;
+use p2poolv2_wallet::Address as ShareAddress;
 use serde::Deserialize;
 use std::marker::PhantomData;
 use std::str::FromStr;
+
+/// Default version mask for BIP 323 version rolling.
+pub const DEFAULT_VERSION_MASK: i32 = 0x1fffe000;
 
 /// Error type for configuration parsing and validation.
 #[derive(Debug, Clone)]
@@ -48,6 +40,21 @@ pub fn parse_address(address: &str, network: Network) -> Result<Address, ConfigE
         })
 }
 
+/// Parse and validate a share chain address string for a given network.
+///
+/// Kept separate from [`parse_address`] because the two live on different
+/// chains: this one owns share coinbase outputs, that one receives bitcoin.
+pub fn parse_share_address(address: &str, network: Network) -> Result<ShareAddress, ConfigError> {
+    ShareAddress::from_str(address)
+        .map_err(|error| ConfigError {
+            message: format!("Invalid share chain address: {error}"),
+        })?
+        .require_network(network)
+        .map_err(|error| ConfigError {
+            message: format!("Invalid share chain address: {error}"),
+        })
+}
+
 /// Max length for pool signature P2Poolv2 + 8 more bytes for users to add
 const MAX_POOL_SIGNATURE_LENGTH: usize = 16;
 
@@ -58,19 +65,15 @@ const MAX_POOL_SIGNATURE_LENGTH: usize = 16;
 /// the share chain ASERT difficulty is not enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PoolMode {
     /// Full P2Poolv2 share chain mode (default)
     #[serde(alias = "P2Poolv2", alias = "p2poolv2")]
+    #[default]
     P2poolv2,
     /// Standalone PPLNS pool mode
     #[serde(alias = "Hydrapool", alias = "hydrapool")]
     Hydrapool,
-}
-
-impl Default for PoolMode {
-    fn default() -> Self {
-        PoolMode::P2poolv2
-    }
 }
 
 /// Marker type for raw (unparsed) StratumConfig state
@@ -108,14 +111,17 @@ pub struct StratumConfig<State = Raw> {
     pub fee_address: Option<String>,
     /// The fee basis points
     pub fee: Option<u16>,
+    /// Share chain address owning every share this pool mines (string in Raw
+    /// state). When set, miners need not send `p2p=` in the stratum password,
+    /// and one that disagrees with this address is rejected at authorize.
+    /// P2Poolv2 mode only; Hydrapool builds no share commitment.
+    pub miner_address: Option<String>,
     /// The network can be "main", "testnet4" or "signet
     #[serde(deserialize_with = "deserialize_network")]
     pub network: bitcoin::Network,
     /// The version mask to use for version-rolling
     #[serde(deserialize_with = "deserialize_version_mask")]
     pub version_mask: i32,
-    /// The difficulty multiplier for dynamic difficulty adjustment
-    pub difficulty_multiplier: f64,
     /// Test config to ignore difficulty
     pub ignore_difficulty: Option<bool>,
     /// Optional pool signature to include in coinbase
@@ -137,6 +143,8 @@ pub struct StratumConfig<State = Raw> {
     pub donation_address_parsed: Option<Address<NetworkChecked>>,
     #[serde(skip)]
     pub fee_address_parsed: Option<Address<NetworkChecked>>,
+    #[serde(skip)]
+    pub miner_address_parsed: Option<ShareAddress>,
 
     #[serde(skip)]
     #[serde(default)]
@@ -165,7 +173,34 @@ impl StratumConfig<Raw> {
             });
         }
 
+        // Hydrapool never builds a share commitment, so a share chain address
+        // could not be used there. Fail at startup rather than let an operator
+        // believe their shares are being assigned to it.
+        if self.miner_address.is_some() && self.mode == PoolMode::Hydrapool {
+            return Err(ConfigError {
+                message:
+                    "miner_address cannot be set when mode is hydrapool, which has no share chain"
+                        .to_string(),
+            });
+        }
+
+        // The network should be one we support an hrp for.
+        if self.mode == PoolMode::P2poolv2 {
+            p2poolv2_wallet::expected_hrp(self.network).map_err(|error| ConfigError {
+                message: format!(
+                    "Network {} cannot be used for a share chain: {error}",
+                    self.network
+                ),
+            })?;
+        }
+
         let bootstrap_address_parsed = parse_address(&self.bootstrap_address, self.network)?;
+
+        let miner_address_parsed = self
+            .miner_address
+            .as_ref()
+            .map(|address| parse_share_address(address, self.network))
+            .transpose()?;
 
         let donation_address_parsed = self
             .donation_address
@@ -192,9 +227,9 @@ impl StratumConfig<Raw> {
             donation: self.donation,
             fee_address: self.fee_address,
             fee: self.fee,
+            miner_address: self.miner_address,
             network: self.network,
             version_mask: self.version_mask,
-            difficulty_multiplier: self.difficulty_multiplier,
             ignore_difficulty: self.ignore_difficulty,
             pool_signature: self.pool_signature,
             max_connections: self.max_connections,
@@ -203,6 +238,7 @@ impl StratumConfig<Raw> {
             bootstrap_address_parsed: Some(bootstrap_address_parsed),
             donation_address_parsed,
             fee_address_parsed,
+            miner_address_parsed,
             _state: PhantomData,
         })
     }
@@ -225,6 +261,14 @@ impl StratumConfig<Parsed> {
     pub fn fee_address(&self) -> Option<&Address<NetworkChecked>> {
         self.fee_address_parsed.as_ref()
     }
+
+    /// Get the pool wide share chain address, if the operator configured one.
+    ///
+    /// When present every share this pool mines is owned by this address, and a
+    /// miner supplying a different one in `p2p=` is rejected at authorize.
+    pub fn miner_address(&self) -> Option<ShareAddress> {
+        self.miner_address_parsed
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -245,9 +289,9 @@ impl StratumConfig<Raw> {
             donation: None,
             fee_address: None,
             fee: None,
+            miner_address: None,
             network: bitcoin::Network::Signet,
-            version_mask: 0x1fffe000,
-            difficulty_multiplier: 1.0,
+            version_mask: DEFAULT_VERSION_MASK,
             ignore_difficulty: None,
             pool_signature: None,
             max_connections: None,
@@ -256,6 +300,7 @@ impl StratumConfig<Raw> {
             bootstrap_address_parsed: None,
             donation_address_parsed: None,
             fee_address_parsed: None,
+            miner_address_parsed: None,
             _state: PhantomData,
         }
     }
@@ -282,6 +327,9 @@ where
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkConfig {
     pub listen_address: String,
+    /// Peers to dial at startup and reconnect to with backoff. Optional;
+    /// when absent the node finds peers through DNS seeds alone.
+    #[serde(default)]
     pub dial_peers: Vec<String>,
     pub max_pending_incoming: u32,
     pub max_pending_outgoing: u32,
@@ -299,6 +347,21 @@ pub struct NetworkConfig {
     /// are immediately disconnected.
     #[serde(default)]
     pub blocked_ips: Vec<String>,
+    /// Optional external address override for nodes behind NAT.
+    /// If set, this address is advertised to peers via the identify protocol.
+    /// Format: Multiaddr string, e.g. "/ip4/203.0.113.1/tcp/6884"
+    #[serde(default)]
+    pub external_address: Option<String>,
+    // Fall back to the built-in DNS seeds for this network when no peer is
+    // connected. Seeds are queried at startup without dial_peers, or 10s
+    // after startup when dial_peers are set but none connected. Set false
+    // to rely only on dial_peers.
+    #[serde(default = "default_dns_seed")]
+    pub dns_seed: bool,
+}
+
+fn default_dns_seed() -> bool {
+    true
 }
 
 impl Default for NetworkConfig {
@@ -310,7 +373,12 @@ impl Default for NetworkConfig {
             max_pending_outgoing: 10,
             max_established_incoming: 50,
             max_established_outgoing: 50,
-            max_established_per_peer: 1,
+            // Two, not one: when two nodes dial each other at the same moment
+            // each can keep its own outbound connection and refuse the other's
+            // inbound one, so with a limit of one both connections close and
+            // they retry. A second slot lets both survive. More only duplicates
+            // traffic, as libp2p multiplexes every protocol over one connection.
+            max_established_per_peer: 2,
             max_workbase_per_second: 10,
             max_userworkbase_per_second: 10,
             max_miningshare_per_second: 100,
@@ -319,6 +387,8 @@ impl Default for NetworkConfig {
             max_requests_per_second: 100,
             dial_timeout_secs: 30,
             blocked_ips: vec![],
+            external_address: None,
+            dns_seed: true,
         }
     }
 }
@@ -326,9 +396,6 @@ impl Default for NetworkConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct StoreConfig {
     pub path: String,
-    /// How often to run background cleanup tasks (in hours)
-    #[serde(default = "default_background_task_frequency_hours")]
-    pub background_task_frequency_hours: u64,
     /// Time-to-live for PPLNS shares (in days)
     #[serde(default = "default_pplns_ttl_days")]
     pub pplns_ttl_days: u64,
@@ -336,10 +403,6 @@ pub struct StoreConfig {
 
 fn default_wait_for_chain_sync() -> bool {
     true
-}
-
-fn default_background_task_frequency_hours() -> u64 {
-    1
 }
 
 fn default_pplns_ttl_days() -> u64 {
@@ -405,6 +468,110 @@ impl std::fmt::Debug for ApiConfig {
     }
 }
 
+/// Configuration for the Electrum wallet server.
+///
+/// The server speaks Electrum JSON-RPC over plain TCP and is meant for the
+/// operator's own wallet only, so it binds localhost by default and has no
+/// TLS or client authentication. It is off unless the `[electrum]` section
+/// enables it.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ElectrumConfig {
+    /// Start the Electrum server with the node
+    #[serde(default)]
+    pub enabled: bool,
+    /// The hostname the Electrum server binds to
+    #[serde(default = "default_electrum_hostname")]
+    pub hostname: String,
+    /// The port the Electrum server binds to
+    #[serde(default = "default_electrum_port")]
+    pub port: u16,
+    /// Maximum number of concurrent wallet connections
+    #[serde(default = "default_electrum_max_connections")]
+    pub max_connections: u32,
+}
+
+fn default_electrum_hostname() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// Conventional Electrum TCP port.
+fn default_electrum_port() -> u16 {
+    50001
+}
+
+/// Local wallets only, so a small cap is plenty.
+fn default_electrum_max_connections() -> u32 {
+    64
+}
+
+impl Default for ElectrumConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname: default_electrum_hostname(),
+            port: default_electrum_port(),
+            max_connections: default_electrum_max_connections(),
+        }
+    }
+}
+
+/// Configuration for the no-PoW load-test simulation.
+///
+/// Only acted upon when a binary is built with the `sim` cargo feature; the
+/// field is always present in `Config` so non-sim builds parse the same config
+/// files without error.
+/// See docs/simulation/load-test-plan.md.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SimConfig {
+    /// Master switch for this node's sim emitter / statistical block-find.
+    #[serde(default)]
+    pub enabled: bool,
+    /// This node's payout identity (bitcoin address); should be distinct per node.
+    pub miner_address: String,
+    /// This node's share chain identity. Cannot be derived from `miner_address`
+    /// -- different chain, different key -- so it is supplied separately.
+    /// Falls back to `[stratum] miner_address` when omitted.
+    #[serde(default)]
+    pub share_address: Option<String>,
+    /// Modeled hashrate Hᵢ in hashes/sec; sets the emission rate.
+    pub hashrate: f64,
+    /// Expected number of shares per bitcoin block (global; same on all nodes).
+    pub block_to_share_ratio: u64,
+    /// Per-node RNG seed for reproducible emission/block-find. Should differ per
+    /// node so timelines decorrelate; omit for a nondeterministic seed. A cheap
+    /// RNG is fine — this is a simulation, not entropy that guards funds.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Artificial delay (milliseconds) applied to this node's outbound share
+    /// announcements, modeling network latency. Over loopback, propagation is
+    /// otherwise near-instant and the chain stays linear; a non-zero delay
+    /// widens the window for concurrent emission, so uncles appear and uncle
+    /// rate tracks this value. Default 0 (no delay).
+    #[serde(default)]
+    pub propagation_delay_ms: Option<u64>,
+    /// Unix time (seconds) to use as the ASERT difficulty anchor instead of the
+    /// genesis timestamp. The fixed regtest genesis is dated in the past, so the
+    /// share chain is permanently "behind schedule" and ASERT stays floored at
+    /// the easy clamp (the chain races, never reaching a steady rate). Setting
+    /// this to ~launch time lets ASERT regulate around the 10s target. MUST be
+    /// identical across all nodes (the harness writes one shared value) or their
+    /// ASERT targets diverge and shares are rejected.
+    #[serde(default)]
+    pub asert_anchor_time: Option<u64>,
+    /// Total network hashrate (hashes/sec) = sum over all nodes. Used to anchor
+    /// the genesis difficulty at the steady-state value (`hashrate · 10s / 2^32`)
+    /// so the chain starts regulated instead of climbing from the easy clamp for
+    /// ~15-20 min. MUST be identical across nodes (it sets the genesis target,
+    /// hence the genesis hash). Omit to keep the fixed genesis target.
+    #[serde(default)]
+    pub network_hashrate: Option<u64>,
+    /// Sim-only override of the ASERT ideal block time (seconds). Smaller =
+    /// more blocks per minute (time-compressed runs for faster data). MUST be
+    /// identical across nodes (ASERT consensus). Omit for the default 10s.
+    #[serde(default)]
+    pub ideal_block_time_secs: Option<u32>,
+}
+
 /// Config for p2poolv2 nodes
 ///
 /// The network config switches to defaults if not provided. This is
@@ -419,6 +586,8 @@ pub struct Config {
     pub bitcoinrpc: BitcoinRpcConfig,
     pub logging: LoggingConfig,
     pub api: ApiConfig,
+    #[serde(default)]
+    pub electrum: ElectrumConfig,
 }
 
 #[allow(dead_code)]
@@ -426,7 +595,15 @@ impl Config {
     pub fn load(path: &str) -> Result<Self, config::ConfigError> {
         config::Config::builder()
             .add_source(config::File::with_name(path))
-            .add_source(config::Environment::with_prefix("P2POOL").separator("_"))
+            // Nesting uses `__` so that a single `_` stays part of a field name.
+            // With a single-underscore separator, P2POOL_STORE_PPLNS_TTL_DAYS
+            // addresses store.pplns.ttl.days, which does not exist, and the
+            // override is silently discarded. See the env_override tests.
+            .add_source(
+                config::Environment::with_prefix("P2POOL")
+                    .prefix_separator("_")
+                    .separator("__"),
+            )
             .build()?
             .try_deserialize()
     }
@@ -468,11 +645,6 @@ impl Config {
 
     pub fn with_store_path(mut self, store_path: String) -> Self {
         self.store.path = store_path;
-        self
-    }
-
-    pub fn with_background_task_frequency_hours(mut self, hours: u64) -> Self {
-        self.store.background_task_frequency_hours = hours;
         self
     }
 
@@ -518,11 +690,6 @@ impl Config {
 
     pub fn with_maximum_difficulty(mut self, maximum_difficulty: Option<u64>) -> Self {
         self.stratum.maximum_difficulty = maximum_difficulty;
-        self
-    }
-
-    pub fn with_difficulty_multiplier(mut self, difficulty_multiplier: f64) -> Self {
-        self.stratum.difficulty_multiplier = difficulty_multiplier;
         self
     }
 
@@ -581,6 +748,21 @@ impl Config {
         self
     }
 
+    pub fn with_electrum_enabled(mut self, enabled: bool) -> Self {
+        self.electrum.enabled = enabled;
+        self
+    }
+
+    pub fn with_electrum_hostname(mut self, hostname: String) -> Self {
+        self.electrum.hostname = hostname;
+        self
+    }
+
+    pub fn with_electrum_port(mut self, port: u16) -> Self {
+        self.electrum.port = port;
+        self
+    }
+
     pub fn with_max_requests_per_second(mut self, max_requests_per_second: u64) -> Self {
         self.network.max_requests_per_second = max_requests_per_second;
         self
@@ -616,7 +798,6 @@ mod tests {
             .with_start_difficulty(1)
             .with_minimum_difficulty(1)
             .with_maximum_difficulty(Some(100))
-            .with_difficulty_multiplier(2.0)
             .with_ignore_difficulty(Some(true))
             .with_bitcoinrpc_url("http://localhost:8332".to_string())
             .with_bitcoinrpc_username("testuser".to_string())
@@ -640,7 +821,6 @@ mod tests {
         assert_eq!(config.stratum.start_difficulty, 1);
         assert_eq!(config.stratum.minimum_difficulty, 1);
         assert_eq!(config.stratum.maximum_difficulty, Some(100));
-        assert_eq!(config.stratum.difficulty_multiplier, 2.0);
         assert!(config.stratum.ignore_difficulty.unwrap());
         assert_eq!(
             config.stratum.solo_address,
@@ -673,7 +853,6 @@ mod tests {
         assert_eq!(config.api.auth_token, Some("secret_token".to_string()));
 
         // Test values from config.sample.toml
-        assert_eq!(config.store.background_task_frequency_hours, 24);
         assert_eq!(config.store.pplns_ttl_days, 7);
     }
 
@@ -681,17 +860,244 @@ mod tests {
     fn test_config_store_background_settings() {
         let config = Config::load("../config.sample.toml")
             .unwrap()
-            .with_background_task_frequency_hours(2)
-            .with_pplns_ttl_days(7);
+            .with_pplns_ttl_days(9);
 
-        assert_eq!(config.store.background_task_frequency_hours, 2);
-        assert_eq!(config.store.pplns_ttl_days, 7);
+        assert_eq!(config.store.pplns_ttl_days, 9);
+    }
+
+    /// Characterisation tests for environment-variable overrides.
+    ///
+    /// `Config::load` layers `config::Environment` with prefix `P2POOL` and
+    /// separator `_` over the TOML file. The separator is also what appears
+    /// inside many field names, so which keys are reachable is not obvious.
+    /// These tests pin the behaviour, because getting it wrong starts the node
+    /// with the wrong settings rather than failing.
+    #[test]
+    fn env_override_applies_to_a_nested_string_field() {
+        with_var("P2POOL_LOGGING__LEVEL", Some("trace"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_eq!(config.logging.level, "trace");
+        });
+    }
+
+    /// Integers arrive from the environment as strings and have to be coerced.
+    #[test]
+    fn env_override_applies_to_a_nested_integer_field() {
+        with_var("P2POOL_API__PORT", Some("59999"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_eq!(config.api.port, 59999);
+        });
+    }
+
+    /// Booleans are coerced from strings the same way integers are.
+    #[test]
+    fn env_override_applies_to_a_nested_bool_field() {
+        with_var("P2POOL_LOGGING__CONSOLE", Some("false"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_eq!(config.logging.console, Some(false));
+        });
+    }
+
+    /// An Option<String> field is populated, not left None.
+    #[test]
+    fn env_override_applies_to_a_nested_option_field() {
+        with_var("P2POOL_LOGGING__FILE", Some("/tmp/env.log"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_eq!(config.logging.file, Some("/tmp/env.log".to_string()));
+        });
+    }
+
+    /// A field whose own name contains an underscore is reachable, because the
+    /// nesting separator is `__` and single underscores stay part of the key.
+    ///
+    /// With a single-underscore separator this override was silently discarded:
+    /// `P2POOL_STORE_PPLNS_TTL_DAYS` addressed `store.pplns.ttl.days`, which
+    /// does not exist, so the file value survived and nothing reported it.
+    #[test]
+    fn env_override_reaches_a_field_whose_name_contains_an_underscore() {
+        with_var("P2POOL_STORE__PPLNS_TTL_DAYS", Some("99"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_eq!(config.store.pplns_ttl_days, 99);
+        });
+    }
+
+    /// The listen address is the other field docker-compose sets that a
+    /// single-underscore separator could not reach.
+    #[test]
+    fn env_override_reaches_the_network_listen_address() {
+        with_var(
+            "P2POOL_NETWORK__LISTEN_ADDRESS",
+            Some("/ip4/10.0.0.1/tcp/6884"),
+            || {
+                let config = Config::load("../config.sample.toml").unwrap();
+                assert_eq!(config.network.listen_address, "/ip4/10.0.0.1/tcp/6884");
+            },
+        );
+    }
+
+    /// dial_peers is optional, so it can be commented out of the config and
+    /// the node relies on DNS seeds alone.
+    #[test]
+    fn dial_peers_defaults_to_empty_when_absent() {
+        let config = Config::load("../config.sample.toml").unwrap();
+        assert!(config.network.dial_peers.is_empty());
+    }
+
+    /// DNS seeds are on unless the operator turns them off.
+    #[test]
+    fn dns_seed_defaults_to_true_when_absent() {
+        let config = Config::load("../config.sample.toml").unwrap();
+        assert!(config.network.dns_seed);
+    }
+
+    /// The sample config leaves `[electrum]` commented out, so the server is
+    /// off and every field takes its default.
+    #[test]
+    fn electrum_defaults_to_disabled_when_section_absent() {
+        let config = Config::load("../config.sample.toml").unwrap();
+        assert!(!config.electrum.enabled);
+        assert_eq!(config.electrum.hostname, "127.0.0.1");
+        assert_eq!(config.electrum.port, 50001);
+        assert_eq!(config.electrum.max_connections, 64);
+    }
+
+    #[test]
+    fn electrum_section_values_are_parsed() {
+        let electrum: ElectrumConfig = config::Config::builder()
+            .add_source(config::File::from_str(
+                "enabled = true\nhostname = \"127.0.0.2\"\nport = 50101\nmax_connections = 8\n",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(electrum.enabled);
+        assert_eq!(electrum.hostname, "127.0.0.2");
+        assert_eq!(electrum.port, 50101);
+        assert_eq!(electrum.max_connections, 8);
+    }
+
+    #[test]
+    fn env_override_sets_electrum_port() {
+        with_var("P2POOL_ELECTRUM__PORT", Some("50999"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_eq!(config.electrum.port, 50999);
+        });
+    }
+
+    #[test]
+    fn test_config_builder_sets_electrum_fields() {
+        let config = Config::load("../config.sample.toml")
+            .unwrap()
+            .with_electrum_enabled(true)
+            .with_electrum_hostname("127.0.0.3".to_string())
+            .with_electrum_port(50202);
+        assert!(config.electrum.enabled);
+        assert_eq!(config.electrum.hostname, "127.0.0.3");
+        assert_eq!(config.electrum.port, 50202);
+    }
+
+    #[test]
+    fn env_override_disables_dns_seed() {
+        with_var("P2POOL_NETWORK__DNS_SEED", Some("false"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert!(!config.network.dns_seed);
+        });
+    }
+
+    /// A single-underscore key no longer resolves, so an operator carrying the
+    /// old spelling forward gets the file value rather than a silent surprise
+    /// in a different field.
+    #[test]
+    fn env_override_ignores_the_old_single_underscore_spelling() {
+        with_var("P2POOL_API_PORT", Some("59999"), || {
+            let config = Config::load("../config.sample.toml").unwrap();
+            assert_ne!(config.api.port, 59999);
+        });
+    }
+
+    /// The exact keys docker/docker-compose.p2poolv2.yml sets, asserted
+    /// together so the container and the config schema cannot drift apart.
+    ///
+    /// Compose deliberately does not set `stratum.network` or
+    /// `bitcoinrpc.url`. Those are the operator's, from the mounted
+    /// config.toml: an override here would silently contradict that file and
+    /// fail late, either on the wrong chain or against the wrong bitcoind.
+    /// `env_override_reaches_the_network_listen_address` covers the one key
+    /// that used to be unreachable and now applies.
+    #[test]
+    fn env_overrides_used_by_docker_compose_all_apply() {
+        temp_env::with_vars(
+            [
+                ("P2POOL_STORE__PATH", Some("/p2poolv2/data/signet")),
+                ("P2POOL_STRATUM__PORT", Some("3333")),
+                ("P2POOL_API__PORT", Some("46884")),
+                (
+                    "P2POOL_NETWORK__LISTEN_ADDRESS",
+                    Some("/ip4/0.0.0.0/tcp/6884"),
+                ),
+            ],
+            || {
+                let config = Config::load("../config.sample.toml").unwrap();
+                assert_eq!(config.store.path, "/p2poolv2/data/signet");
+                assert_eq!(config.stratum.port, 3333);
+                assert_eq!(config.api.port, 46884);
+                assert_eq!(config.network.listen_address, "/ip4/0.0.0.0/tcp/6884");
+            },
+        );
+    }
+
+    /// The bitcoind endpoint must stay a passthrough in compose, never a
+    /// forced value.
+    #[test]
+    fn docker_compose_passes_the_bitcoind_endpoint_through_without_a_default() {
+        let entries: Vec<&str> = include_str!("../../docker/docker-compose.p2poolv2.yml")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("- P2POOL_"))
+            .collect();
+        let endpoint = entries
+            .iter()
+            .find(|line| line.contains("BITCOINRPC__URL"))
+            .expect("compose should pass the bitcoind endpoint through");
+        assert_eq!(
+            *endpoint, "- P2POOL_BITCOINRPC__URL",
+            "must be a bare passthrough, with no value or default"
+        );
+    }
+
+    /// NETWORK drives both the chain and the store directory, and is required
+    /// rather than defaulted.
+    #[test]
+    fn docker_compose_requires_network_and_uses_it_for_chain_and_store() {
+        let entries: Vec<&str> = include_str!("../../docker/docker-compose.p2poolv2.yml")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("- P2POOL_"))
+            .collect();
+        let chain = entries
+            .iter()
+            .find(|line| line.contains("STRATUM__NETWORK"))
+            .expect("compose should set the chain from NETWORK");
+        assert!(
+            chain.contains("${NETWORK:?"),
+            "NETWORK must be required, not defaulted: {chain}"
+        );
+        let store = entries
+            .iter()
+            .find(|line| line.contains("STORE__PATH"))
+            .expect("compose should set the store path");
+        assert!(
+            store.contains("${NETWORK}"),
+            "store path must follow the same NETWORK as the chain: {store}"
+        );
     }
 
     #[test]
     fn test_config_from_env_vars() {
         with_var(
-            "P2POOL_BITCOINRPC_URL",
+            "P2POOL_BITCOINRPC__URL",
             Some("http://bitcoin-from-env:8332"),
             || {
                 // Load config from file first
@@ -707,6 +1113,41 @@ mod tests {
     fn test_default_network_config() {
         let config = NetworkConfig::default();
         assert!(config.listen_address.is_empty());
+    }
+
+    /// A share address belongs to a network exactly when its prefix is the one
+    /// that network expects, so a network with no prefix can never accept one.
+    /// Caught at startup: otherwise the node runs and rejects every authorize,
+    /// forever, for a reason no miner can fix.
+    ///
+    /// `miner_address` is unset here, which is an ordinary p2poolv2 setup --
+    /// miners supply their own with `p2p=`. So the network cannot be validated
+    /// through a configured address; it has to be checked on its own.
+    #[test]
+    fn parse_rejects_a_network_with_no_share_address_prefix() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.network = Network::Testnet;
+        config.mode = PoolMode::P2poolv2;
+        assert!(config.miner_address.is_none());
+
+        let error = config.parse().expect_err("testnet v3 has no share prefix");
+        assert!(
+            error.message.contains("cannot be used for a share chain"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    /// Hydrapool builds no share commitment, so it needs no share address and
+    /// must not be held to a rule that does not apply to it.
+    #[test]
+    fn parse_allows_an_unusable_network_in_hydrapool_mode() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.network = Network::Testnet;
+        config.mode = PoolMode::Hydrapool;
+        config.miner_address = None;
+
+        assert!(config.parse().is_ok());
     }
 
     #[test]
@@ -840,5 +1281,119 @@ mod tests {
         config.mode = PoolMode::Hydrapool;
         let parsed = config.parse().unwrap();
         assert_eq!(parsed.mode, PoolMode::Hydrapool);
+    }
+}
+
+#[cfg(test)]
+mod miner_address_tests {
+    use super::*;
+
+    /// BIP086 output key of the genesis NUMS pubkey, encoded for each network.
+    /// The test helper config uses Signet.
+    const SIGNET_ADDRESS: &str =
+        "sp2pool1pvmde7zkgeg9qqcpsy7e6g3w6dm3d7mqwqnudcmuedk6wt8gwgkls4zffd6";
+    const TESTNET4_ADDRESS: &str =
+        "tp2pool1pvmde7zkgeg9qqcpsy7e6g3w6dm3d7mqwqnudcmuedk6wt8gwgkls3qc3th";
+
+    /// A p2poolv2 pool with no configured address is a normal setup, not an
+    /// edge case: each miner supplies its own with `p2p=`. The mode is set
+    /// explicitly rather than left to `PoolMode::default()`, so this keeps
+    /// covering p2poolv2 even if that default ever changes.
+    #[test]
+    fn absent_miner_address_parses_to_none() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.mode = PoolMode::P2poolv2;
+
+        let parsed = config.parse().unwrap();
+        assert!(parsed.miner_address().is_none());
+        assert_eq!(parsed.mode, PoolMode::P2poolv2);
+    }
+
+    #[test]
+    fn valid_miner_address_is_parsed_and_exposed() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.miner_address = Some(SIGNET_ADDRESS.to_string());
+
+        let parsed = config.parse().unwrap();
+
+        assert_eq!(
+            parsed.miner_address().map(|address| address.to_string()),
+            Some(SIGNET_ADDRESS.to_string())
+        );
+        assert_eq!(parsed.miner_address().unwrap().network(), Network::Signet);
+    }
+
+    /// A share address for another network must be rejected at config parse,
+    /// so the node fails at startup rather than assigning every share on the
+    /// pool to an address the operator cannot use.
+    #[test]
+    fn miner_address_for_another_network_is_rejected() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.miner_address = Some(TESTNET4_ADDRESS.to_string());
+
+        let error = config.parse().unwrap_err();
+
+        assert!(
+            error.message.contains("share chain address"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn malformed_miner_address_is_rejected() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.miner_address = Some("not-a-share-address".to_string());
+
+        let error = config.parse().unwrap_err();
+
+        assert!(
+            error.message.contains("share chain address"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    /// A bitcoin address here is the mistake the whole address type exists to
+    /// prevent, so it must fail loudly at startup.
+    #[test]
+    fn bitcoin_address_as_miner_address_is_rejected() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.miner_address = Some("tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk".to_string());
+
+        assert!(config.parse().is_err());
+    }
+
+    /// Hydrapool builds no share commitment, so the field could never be used.
+    #[test]
+    fn miner_address_with_hydrapool_mode_is_rejected() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.miner_address = Some(SIGNET_ADDRESS.to_string());
+        config.mode = PoolMode::Hydrapool;
+
+        let error = config.parse().unwrap_err();
+
+        assert!(
+            error.message.contains("hydrapool"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn hydrapool_without_a_miner_address_still_parses() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.mode = PoolMode::Hydrapool;
+
+        assert!(config.parse().is_ok());
+    }
+
+    #[test]
+    fn miner_address_with_p2poolv2_mode_is_accepted() {
+        let mut config = StratumConfig::<Raw>::new_for_test_default();
+        config.miner_address = Some(SIGNET_ADDRESS.to_string());
+        config.mode = PoolMode::P2poolv2;
+
+        assert!(config.parse().is_ok());
     }
 }

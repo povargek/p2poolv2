@@ -1,11 +1,17 @@
 [network]
 listen_address = "/ip4/0.0.0.0/tcp/6884"
 dial_peers = []
+# Resolve the built-in DNS seeds for this network at startup and dial the
+# returned nodes. Set false to rely only on dial_peers.
+# dns_seed = true
 max_pending_incoming = 10
 max_pending_outgoing = 10
 max_established_incoming = 50
 max_established_outgoing = 50
-max_established_per_peer = 1
+# Two, not one: room for an inbound and an outbound connection when two
+# nodes dial each other at once. More only duplicates traffic -- libp2p
+# multiplexes every protocol over a single connection.
+max_established_per_peer = 2
 max_workbase_per_second = 10
 max_userworkbase_per_second = 10
 max_miningshare_per_second = 100
@@ -16,7 +22,6 @@ dial_timeout_secs = 30
 
 [store]
 path = "/p2poolv2/data/store.db"
-background_task_frequency_hours = 24
 pplns_ttl_days = 7
 
 [stratum]
@@ -25,6 +30,25 @@ port = 3333
 start_difficulty = 10000
 minimum_difficulty = 100
 solo_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
+# Pool operating mode: "p2poolv2" (share chain) or "hydrapool"
+# (standalone PPLNS, no share chain). Default p2poolv2.
+# mode = "p2poolv2"
+# Share chain address owning every share this node mines. In p2poolv2
+# mode a share needs an owner, so a miner that does not send
+# p2p=<address> in its stratum password gets this address instead.
+# Leave it unset only if every one of your miners sends p2p=; otherwise
+# they are rejected at authorize.
+# Not valid with mode = "hydrapool", which has no share chain.
+#
+# Set this to YOUR OWN share chain address before enabling it. There is
+# deliberately no default: any address published here would own the shares
+# of everyone who copied this file, and a placeholder would silently burn
+# them.
+#
+# Note a configured address is authoritative, so a miner that sends a
+# different p2p=<address> is rejected as a conflict. Set this only if you
+# want every share to belong to the node.
+# miner_address = "sp2pool1..."
 # The bitcoin address to use for first jobs when there are no shares
 bootstrap_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
 # Any donation amount for developers to be sent to donation address. Default no donation.
@@ -38,14 +62,18 @@ bootstrap_address = "tb1qyazxde6558qj6z3d9np5e6msmrspwpf6k0qggk"
 zmqpubhashblock = "tcp://bitcoind:28332"
 # The network can be "main", "testnet4" or "signet"
 network = "signet"
-version_mask = "1fffe000"
-# The difficulty multiplier defines the window size for calculating payout proportions
-# See https://github.com/p2poolv2/p2poolv2/wiki/Difficult-Multiplier on how to choose this
-difficulty_multiplier = 1.0
+# Use BIP 323 mask for version rolling (see https://github.com/bitcoin/bips/blob/622e47722cd35514e96da37ae89f868e18d581e4/bip-0323.mediawiki#specification)
+version_mask = "1fffffe0"
+# The PPLNS payout window is fixed for the network, not configured: each
+# coinbase pays the last 120,960 shares (about two weeks at the 10 second
+# share target), weighted by share difficulty.
 # Add a pool signature, if you want. Comment out the line if you want
 # to mine anonymous blocks. This signature is only used to show others
 # how large your pool is, if you are running private, there is no need
 # to add a pool signature. Maximum length 16 bytes.
+# It only tags the coinbases this node builds. It is not part of consensus:
+# peers read each block's signature from its own coinbase, so nodes with
+# different signatures, or none, still accept each other's shares.
 pool_signature = "P2Poolv2"
 
 [bitcoinrpc]

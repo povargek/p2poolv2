@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Store handle providing direct reads and serialized writes.
 //!
@@ -24,8 +12,11 @@ use super::{StoreError, WriteCommand, WriteSender};
 use crate::accounting::payout::simple_pplns::SimplePplnsShare;
 use crate::shares::share_block::{ShareBlock, ShareHeader};
 use crate::store::Store;
+use crate::store::found_block::FoundBlock;
+use crate::store::prune_blocks::PruneStats;
 use crate::store::stored_user::StoredUser;
-use bitcoin::{BlockHash, Work};
+use crate::store::transaction_store::PrevoutCheck;
+use bitcoin::{BlockHash, TxMerkleNode, Work};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -63,37 +54,35 @@ impl StoreHandle {
         self.store.get_all_prevouts(transaction)
     }
 
-    /// Batch-read all outpoints from the Outputs CF.
-    /// Returns an error if any is missing, otherwise returns coinbase outpoints.
-    pub fn check_prevouts_and_find_coinbase(
+    /// Batch-read all outpoints from the Outputs CF and check the rules that
+    /// depend only on the spending block: existence, coinbase root window, and
+    /// coinbase maturity. A violation comes back as `PrevoutCheck::Rejected`;
+    /// `Err` means the read itself failed.
+    pub fn check_prevouts(
         &self,
         outpoints: &[bitcoin::OutPoint],
-    ) -> Result<Vec<bitcoin::OutPoint>, StoreError> {
-        self.store.check_prevouts_and_find_coinbase(outpoints)
+        spending_height: u32,
+        min_coinbase_root_height: u32,
+        coinbase_maturity: usize,
+    ) -> Result<PrevoutCheck, StoreError> {
+        self.store.check_prevouts(
+            outpoints,
+            spending_height,
+            min_coinbase_root_height,
+            coinbase_maturity,
+        )
     }
 
-    /// Return the first coinbase outpoint that is not yet mature, or None.
-    pub fn find_immature_coinbase_prevout(
+    /// Return true when every listed block, and every uncle it references,
+    /// either has its block body stored or sits below `prune_height`, where
+    /// bodies are never fetched.
+    pub fn all_block_and_uncle_data_available(
         &self,
-        coinbase_outpoints: &[bitcoin::OutPoint],
-        min_depth: usize,
-        tip_height: u32,
-    ) -> Result<Option<bitcoin::OutPoint>, StoreError> {
-        self.store
-            .find_immature_coinbase_prevout(coinbase_outpoints, min_depth, tip_height)
-    }
-
-    /// Batch check the SpendsIndex CF: true if any outpoint is already spent.
-    pub fn is_any_prevout_spent(
-        &self,
-        outpoints: &[bitcoin::OutPoint],
+        blockhashes: &[BlockHash],
+        prune_height: u32,
     ) -> Result<bool, StoreError> {
-        self.store.is_any_prevout_spent(outpoints)
-    }
-
-    /// Returns true if every txid is on the confirmed sharechain.
-    pub fn are_all_txids_confirmed(&self, txids: &[bitcoin::Txid]) -> Result<bool, StoreError> {
-        self.store.are_all_txids_confirmed(txids)
+        self.store
+            .all_block_and_uncle_data_available(blockhashes, prune_height)
     }
 
     /// Retrieve a single transaction output by txid and output index.
@@ -180,6 +169,11 @@ impl StoreHandle {
     /// Get the total work of the chain.
     pub fn get_total_work(&self) -> Result<Work, StoreError> {
         self.store.get_total_work()
+    }
+
+    /// Get every bitcoin block found by the pool, ordered by bitcoin height.
+    pub fn get_found_blocks(&self) -> Result<Vec<FoundBlock>, StoreError> {
+        self.store.get_found_blocks()
     }
 
     /// Get the confirmed blockhash at a specific height.
@@ -334,6 +328,62 @@ impl StoreHandle {
         reply_rx.await.map_err(|_| StoreError::ChannelClosed)?
     }
 
+    /// Mark a block Invalid so it is never promoted to confirmed.
+    pub async fn mark_invalid(&self, blockhash: BlockHash) -> Result<(), StoreError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkInvalid {
+                blockhash,
+                reply: reply_tx,
+            })
+            .map_err(|_| StoreError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| StoreError::ChannelClosed)?
+    }
+
+    /// Store the coinbase merkle branches of a batch of synced headers.
+    pub async fn add_header_template_merkle_branches(
+        &self,
+        entries: Vec<(BlockHash, Vec<TxMerkleNode>)>,
+    ) -> Result<(), StoreError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::AddHeaderTemplateMerkleBranches {
+                entries,
+                reply: reply_tx,
+            })
+            .map_err(|_| StoreError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| StoreError::ChannelClosed)?
+    }
+
+    /// Mark a block BlockValid after it passes chain-context validation.
+    pub async fn mark_block_valid(&self, blockhash: BlockHash) -> Result<(), StoreError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkBlockValid {
+                blockhash,
+                reply: reply_tx,
+            })
+            .map_err(|_| StoreError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| StoreError::ChannelClosed)?
+    }
+
+    /// Delete the block bodies at heights `[from, to)` in one batch.
+    pub async fn prune_block_bodies_chunk(
+        &self,
+        from: u32,
+        to: u32,
+    ) -> Result<PruneStats, StoreError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::PruneBlockBodiesChunk {
+                from,
+                to,
+                reply: reply_tx,
+            })
+            .map_err(|_| StoreError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| StoreError::ChannelClosed)?
+    }
+
     /// Add a PPLNS share for accounting.
     pub async fn add_pplns_share(&self, pplns_share: SimplePplnsShare) -> Result<(), StoreError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -377,6 +427,7 @@ mockall::mock! {
         pub fn get_genesis_blockhash(&self) -> Option<BlockHash>;
         pub fn get_chain_tip(&self) -> Result<BlockHash, StoreError>;
         pub fn get_total_work(&self) -> Result<Work, StoreError>;
+        pub fn get_found_blocks(&self) -> Result<Vec<FoundBlock>, StoreError>;
         pub fn get_confirmed_at_height(&self, height: u32) -> Result<BlockHash, StoreError>;
         pub fn get_pplns_shares(&self) -> Vec<SimplePplnsShare>;
         pub fn get_pplns_shares_filtered(&self, limit: Option<usize>, start_time: Option<u64>, end_time: Option<u64>) -> Vec<SimplePplnsShare>;
@@ -388,12 +439,16 @@ mockall::mock! {
         // Serialized writes (async)
         pub async fn organise_header(&self, header: ShareHeader) -> Result<Option<u32>, StoreError>;
         pub async fn organise_block(&self) -> Result<Option<u32>, StoreError>;
+        pub async fn mark_invalid(&self, blockhash: BlockHash) -> Result<(), StoreError>;
+        pub async fn mark_block_valid(&self, blockhash: BlockHash) -> Result<(), StoreError>;
+        pub async fn add_header_template_merkle_branches(&self, entries: Vec<(BlockHash, Vec<TxMerkleNode>)>) -> Result<(), StoreError>;
         pub async fn add_share_block(&self, share: ShareBlock) -> Result<(), StoreError>;
         pub async fn add_share_block_and_organise_header(&self, share: ShareBlock) -> Result<Option<u32>, StoreError>;
         pub async fn setup_genesis(&self, genesis: ShareBlock) -> Result<(), StoreError>;
         pub async fn init_chain_state_from_store(&self, genesis_hash: BlockHash) -> Result<(), StoreError>;
         pub async fn add_user(&self, btcaddress: String) -> Result<u64, StoreError>;
         pub async fn add_pplns_share(&self, pplns_share: SimplePplnsShare) -> Result<(), StoreError>;
+        pub async fn prune_block_bodies_chunk(&self, from: u32, to: u32) -> Result<PruneStats, StoreError>;
 
         // Sync chain state updates
         pub fn set_genesis_blockhash(&self, hash: BlockHash);

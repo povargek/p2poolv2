@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::api::error::ApiError;
 use crate::api::server::AppState;
@@ -20,9 +8,9 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use bitcoin::BlockHash;
+use bitcoin::{BlockHash, Network};
+use p2poolv2_lib::address::witness_program_codec::to_address_string;
 use p2poolv2_lib::shares::chain::chain_store_handle::ChainStoreHandle;
-use p2poolv2_lib::store::block_tx_metadata::Status;
 use p2poolv2_lib::store::dag_store::MAX_UNCLES_DEPTH;
 use p2poolv2_lib::store::writer::StoreError;
 use p2poolv2_lib::utils::time_provider::format_timestamp;
@@ -58,36 +46,36 @@ pub struct BitcoinHeaderOutput {
 pub struct ShareLookupOutput {
     pub blockhash: String,
     pub height: Option<u32>,
-    pub status: String,
+    /// Validation state only. Chain position is reported separately in `chain`.
+    pub validation_status: String,
+    pub chain: String,
     pub parent: String,
     pub uncles: Vec<String>,
+    pub miner_bitcoin_address: String,
     pub miner_address: String,
-    pub merkle_root: String,
+    pub share_witness_root: String,
     pub bits: String,
     pub time: String,
     pub bitcoin_header: BitcoinHeaderOutput,
     pub template_merkle_branches_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transactions: Option<Vec<String>>,
-}
-
-/// Format a Status enum value as a human-readable string.
-fn format_status(status: &Status) -> &'static str {
-    match status {
-        Status::Pending => "Pending",
-        Status::HeaderValid => "HeaderValid",
-        Status::Invalid => "Invalid",
-        Status::Candidate => "Candidate",
-        Status::BlockValid => "BlockValid",
-        Status::Confirmed => "Confirmed",
-    }
+    /// The body was pruned, so a full lookup has no transactions. Only
+    /// serialized when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pruned: bool,
 }
 
 /// Build the JSON output for a single share identified by its blockhash.
+///
+/// A full lookup of a share below `prune_height` whose body is gone returns
+/// the header with `pruned` set instead of failing.
 fn build_share_output(
     chain_store_handle: &ChainStoreHandle,
     blockhash: &BlockHash,
     full: bool,
+    network: Network,
+    prune_height: u32,
 ) -> Result<ShareLookupOutput, ApiError> {
     let store = chain_store_handle.store_handle().store();
 
@@ -111,7 +99,11 @@ fn build_share_output(
         .and_then(|metadata| metadata.expected_height);
     let status = metadata
         .as_ref()
-        .map(|metadata| format_status(&metadata.status))
+        .map(|metadata| metadata.status.as_str())
+        .unwrap_or("Unknown");
+    let chain = metadata
+        .as_ref()
+        .map(|metadata| metadata.chain.as_str())
         .unwrap_or("Unknown");
 
     let bitcoin_header = &share_header.bitcoin_header;
@@ -130,39 +122,48 @@ fn build_share_output(
         .unwrap_or_default()
         .len();
 
-    let transaction_ids = if full {
-        let share_block = chain_store_handle.get_share(blockhash).ok_or_else(|| {
-            ApiError::NotFound(format!("Full share not found for blockhash {blockhash}"))
-        })?;
-
-        let txids: Vec<String> = share_block
-            .transactions
-            .iter()
-            .map(|transaction| transaction.compute_txid().to_string())
-            .collect();
-
-        Some(txids)
+    let below_prune_height = height.is_some_and(|height| height < prune_height);
+    let (transaction_ids, pruned) = if full {
+        match chain_store_handle.get_share(blockhash) {
+            Some(share_block) => {
+                let txids: Vec<String> = share_block
+                    .transactions
+                    .iter()
+                    .map(|transaction| transaction.compute_txid().to_string())
+                    .collect();
+                (Some(txids), false)
+            }
+            None if below_prune_height => (None, true),
+            None => {
+                return Err(ApiError::NotFound(format!(
+                    "Full share not found for blockhash {blockhash}"
+                )));
+            }
+        }
     } else {
-        None
+        (None, false)
     };
 
     Ok(ShareLookupOutput {
         blockhash: blockhash.to_string(),
         height,
-        status: status.to_string(),
+        validation_status: status.to_string(),
+        chain: chain.to_string(),
         parent: share_header.prev_share_blockhash.to_string(),
         uncles: share_header
             .uncles
             .iter()
             .map(|uncle| uncle.to_string())
             .collect(),
-        miner_address: share_header.miner_bitcoin_address.to_string(),
-        merkle_root: share_header.merkle_root.to_string(),
+        miner_bitcoin_address: share_header.miner_bitcoin_address.to_string(),
+        miner_address: to_address_string(&share_header.miner_address, network),
+        share_witness_root: share_header.coinbase_proof.share_witness_root.to_string(),
         bits: format!("{:#x}", share_header.bits.to_consensus()),
         time: format_timestamp(share_header.time as u64),
         bitcoin_header: bitcoin_header_output,
         template_merkle_branches_count,
         transactions: transaction_ids,
+        pruned,
     })
 }
 
@@ -176,16 +177,33 @@ pub(crate) async fn share(
 ) -> Result<Json<Vec<ShareLookupOutput>>, ApiError> {
     let chain_store_handle = &state.chain_store_handle;
     let full = query.full.unwrap_or(false);
+    let prune_height = chain_store_handle
+        .store_handle()
+        .store()
+        .prune_height()
+        .map_err(|error| ApiError::ServerError(format!("Failed to read prune height: {error}")))?;
 
     match (query.hash, query.height) {
         (Some(hash_string), None) => {
             let blockhash = BlockHash::from_str(&hash_string).map_err(|error| {
                 ApiError::BadRequest(format!("Invalid blockhash '{hash_string}': {error}"))
             })?;
-            let output = build_share_output(chain_store_handle, &blockhash, full)?;
+            let output = build_share_output(
+                chain_store_handle,
+                &blockhash,
+                full,
+                state.app_config.network,
+                prune_height,
+            )?;
             Ok(Json(vec![output]))
         }
-        (None, Some(height)) => lookup_by_height(chain_store_handle, height, full),
+        (None, Some(height)) => lookup_by_height(
+            chain_store_handle,
+            height,
+            full,
+            state.app_config.network,
+            prune_height,
+        ),
         _ => Err(ApiError::BadRequest(
             "Exactly one of hash or height must be provided".to_string(),
         )),
@@ -198,6 +216,8 @@ fn lookup_by_height(
     chain_store_handle: &ChainStoreHandle,
     height: u32,
     full: bool,
+    network: Network,
+    prune_height: u32,
 ) -> Result<Json<Vec<ShareLookupOutput>>, ApiError> {
     let store = chain_store_handle.store_handle().store();
     let mut blockhashes = Vec::with_capacity(4);
@@ -243,7 +263,13 @@ fn lookup_by_height(
 
     let mut outputs = Vec::with_capacity(blockhashes.len());
     for blockhash in &blockhashes {
-        outputs.push(build_share_output(chain_store_handle, blockhash, full)?);
+        outputs.push(build_share_output(
+            chain_store_handle,
+            blockhash,
+            full,
+            network,
+            prune_height,
+        )?);
     }
     Ok(Json(outputs))
 }
@@ -256,9 +282,10 @@ mod tests {
     use p2poolv2_lib::accounting::stats::metrics;
     use p2poolv2_lib::monitoring_events::create_monitoring_event_channel;
     use p2poolv2_lib::node::actor::NodeHandle;
-    use p2poolv2_lib::store::block_tx_metadata::Status;
     use p2poolv2_lib::stratum::work::tracker::start_tracker_actor;
-    use p2poolv2_lib::test_utils::{genesis_for_tests, setup_test_chain_store_handle};
+    use p2poolv2_lib::test_utils::{
+        build_confirmed_test_chain, genesis_for_tests, setup_test_chain_store_handle,
+    };
 
     async fn build_test_state(node_handle: NodeHandle) -> (Arc<AppState>, tempfile::TempDir) {
         let (chain_store_handle, temp_dir) = setup_test_chain_store_handle(true).await;
@@ -283,16 +310,6 @@ mod tests {
             auth_token: None,
         });
         (state, temp_dir)
-    }
-
-    #[test]
-    fn test_format_status_all_variants() {
-        assert_eq!(format_status(&Status::Pending), "Pending");
-        assert_eq!(format_status(&Status::HeaderValid), "HeaderValid");
-        assert_eq!(format_status(&Status::Invalid), "Invalid");
-        assert_eq!(format_status(&Status::Candidate), "Candidate");
-        assert_eq!(format_status(&Status::BlockValid), "BlockValid");
-        assert_eq!(format_status(&Status::Confirmed), "Confirmed");
     }
 
     #[tokio::test]
@@ -426,5 +443,66 @@ mod tests {
 
         let result = share(State(state), query).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_full_lookup_of_pruned_share_returns_header_marked_pruned() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let blocks = build_confirmed_test_chain(&chain_store_handle, 4).await;
+        chain_store_handle.prune_block_bodies(1, 3).await.unwrap();
+
+        let output = build_share_output(
+            &chain_store_handle,
+            &blocks[1].block_hash(),
+            true,
+            Network::Signet,
+            3,
+        )
+        .unwrap();
+
+        assert!(output.pruned);
+        assert!(output.transactions.is_none());
+        assert_eq!(output.height, Some(1));
+    }
+
+    /// A missing body at or above the prune height has not been fetched yet;
+    /// that is still NotFound, not pruned.
+    #[tokio::test]
+    async fn test_full_lookup_of_missing_body_above_prune_height_is_not_found() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let blocks = build_confirmed_test_chain(&chain_store_handle, 4).await;
+        chain_store_handle.prune_block_bodies(1, 3).await.unwrap();
+
+        let result = build_share_output(
+            &chain_store_handle,
+            &blocks[1].block_hash(),
+            true,
+            Network::Signet,
+            0,
+        );
+
+        assert!(matches!(result, Err(ApiError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_full_lookup_of_kept_share_lists_transactions_and_is_not_pruned() {
+        let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+        let blocks = build_confirmed_test_chain(&chain_store_handle, 4).await;
+        chain_store_handle.prune_block_bodies(1, 3).await.unwrap();
+
+        let output = build_share_output(
+            &chain_store_handle,
+            &blocks[3].block_hash(),
+            true,
+            Network::Signet,
+            3,
+        )
+        .unwrap();
+
+        assert!(!output.pruned);
+        assert_eq!(
+            output.transactions.unwrap().len(),
+            blocks[3].transactions.len()
+        );
     }
 }

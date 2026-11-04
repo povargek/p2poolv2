@@ -11,7 +11,12 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 default-run = "p2poolv2"
+
+[lib]
+name = "p2poolv2_node"
+path = "src/lib.rs"
 
 [dependencies]
 tokio = { workspace = true }
@@ -24,7 +29,9 @@ bitcoin = { workspace = true }
 bitcoindrpc = { workspace = true }
 p2poolv2_api = { workspace = true }
 p2poolv2_cli = { path = "../p2poolv2_cli" }
+p2poolv2_electrum = { workspace = true }
 p2poolv2_lib = { workspace = true }
+tokio-util = { workspace = true }
 
 [[bin]]
 name = "p2poolv2"
@@ -41,9 +48,12 @@ required-features = ["debug-tools"]
 
 [features]
 debug-tools = []
+# Sim build: short background task interval to match the sim prune depth.
+# Enabled by p2poolv2_sim's sim feature; never in a release build.
+sim = ["p2poolv2_lib/sim"]
 
 [dev-dependencies]
-p2poolv2_lib = { workspace = true, features = ["test-utils"] }
+p2poolv2_lib = { workspace = true, features = ["test-utils", "hydrapool-pplns-accounting"] }
 mockall.workspace = true
 mockall_double.workspace = true
 tempfile.workspace = true

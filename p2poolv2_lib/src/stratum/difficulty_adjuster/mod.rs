@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Difficulty adjuster module based on CKPool's algorithm.
 //!
@@ -374,8 +362,8 @@ impl DifficultyAdjusterTrait for DifficultyAdjuster {
         }
 
         // Cap diff to pool maximum difficulty
-        if self.pool_maximum_difficulty.is_some() {
-            diff = diff.min(self.pool_maximum_difficulty.unwrap());
+        if let Some(maximum) = self.pool_maximum_difficulty {
+            diff = diff.min(maximum);
         }
         diff
     }
@@ -559,15 +547,12 @@ mod tests {
             // Submit 24 shares with 10 seconds interval
             let (new_diff, _) = adjuster.record_share_submission(
                 min_diff as u128,
-                (i + 2) as u64,
+                i + 2,
                 None,
-                current_timestamp + Duration::from_secs(i * 10 as u64),
+                current_timestamp + Duration::from_secs(i * 10_u64),
             );
-            match new_diff {
-                Some(diff) => {
-                    assert!(diff < start_difficulty); // Should not change yet
-                }
-                None => {}
+            if let Some(diff) = new_diff {
+                assert!(diff < start_difficulty); // Should not change yet
             }
         }
         assert_eq!(adjuster.share_submission_difficulty_counter, 24);
@@ -613,15 +598,12 @@ mod tests {
             // Submit 24 shares with 10 seconds interval
             let (new_diff, _) = adjuster.record_share_submission(
                 min_diff as u128,
-                (i + 2) as u64,
+                i + 2,
                 None,
-                current_timestamp + Duration::from_secs(i * 10 as u64),
+                current_timestamp + Duration::from_secs(i * 10_u64),
             );
-            match new_diff {
-                Some(diff) => {
-                    assert!(diff < start_difficulty); // Should not change yet
-                }
-                None => {}
+            if let Some(diff) = new_diff {
+                assert!(diff < start_difficulty); // Should not change yet
             }
         }
         assert_eq!(adjuster.share_submission_difficulty_counter, 24);
@@ -669,18 +651,18 @@ mod tests {
             if i < MIN_SHARES_BEFORE_ADJUST as u64 {
                 let (new_diff, _) = adjuster.record_share_submission(
                     min_diff as u128,
-                    (i + 2) as u64,
+                    i + 2,
                     None,
-                    current_timestamp + Duration::from_secs(i * 1 as u64),
+                    current_timestamp + Duration::from_secs(i),
                 );
                 assert!(new_diff.is_none());
             } else {
                 // The last share should trigger adjustment
                 let (new_diff, _) = adjuster.record_share_submission(
                     min_diff as u128,
-                    (i + 2) as u64,
+                    i + 2,
                     None,
-                    current_timestamp + Duration::from_secs(i * 1 as u64),
+                    current_timestamp + Duration::from_secs(i),
                 );
                 assert!(new_diff.is_some());
                 assert_eq!(new_diff.unwrap(), 1156);
@@ -734,7 +716,7 @@ mod tests {
         // Expected optimal diff with dsps=600 and TARGET_DRR=0.3 is about 2000
         assert!(new_diff > min_diff);
         // With bias close to 1.0, should be close to dsps/TARGET_DRR = 600/0.3 = 2000
-        assert!(new_diff >= 1900 && new_diff <= 2100);
+        assert!((1900..=2100).contains(&new_diff));
     }
 
     #[test]

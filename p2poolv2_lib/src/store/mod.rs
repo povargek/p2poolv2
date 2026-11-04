@@ -1,26 +1,14 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::shares::share_block::ShareBlock;
-use crate::store::block_tx_metadata::{BlockMetadata, Status};
+use crate::store::block_tx_metadata::{BlockMetadata, ChainMembership, Status};
 use crate::store::column_families::ColumnFamily;
 use crate::store::dag_store::{MAX_BLOCKS_PER_HEIGHT, MAX_UNCLES_DEPTH};
 use bitcoin::consensus::{Encodable, encode};
 use bitcoin::{BlockHash, Work};
-use rocksdb::{ColumnFamilyDescriptor, DB, Options as RocksDbOptions};
+use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, DB, Options as RocksDbOptions};
 use std::sync::{Arc, RwLock};
 use tracing::debug;
 use writer::StoreError;
@@ -28,8 +16,10 @@ use writer::StoreError;
 pub mod block_tx_metadata;
 pub mod column_families;
 pub mod dag_store;
+pub mod found_block;
 pub mod organise;
 mod pplns_shares;
+pub mod prune_blocks;
 mod prune_shares;
 pub mod share_store;
 pub mod stored_user;
@@ -117,28 +107,44 @@ fn parse_blockhash_bytes(bytes: &[u8]) -> Option<Vec<BlockHash>> {
 /// We use column families to store different types of data, so that compactions are independent for each type.
 #[allow(dead_code)]
 impl Store {
+    /// Build CF options with a 10-bit bloom filter for point-lookup CFs.
+    /// Bloom filters eliminate disk reads for keys that don't exist,
+    /// which speeds up existence checks and negative lookups during sync.
+    fn cf_options_with_bloom() -> RocksDbOptions {
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_bloom_filter(10.0, false);
+        let mut opts = RocksDbOptions::default();
+        opts.set_block_based_table_factory(&block_opts);
+        opts
+    }
+
     /// Create a new share store
     pub fn new(path: String, read_only: bool) -> Result<Self, StoreError> {
-        // for now we use default options for all column families, we can tweak this later based on performance testing
+        // Point-lookup CFs get bloom filters to speed up existence checks
+        // and reject negative lookups without disk I/O.
+        // Merge/iterator CFs (BlockIndex, BlockHeight, TxidsBlocks, Uncles)
+        // skip bloom filters since they primarily use range scans or merges.
         let block_metadata_cf_descriptor =
-            ColumnFamilyDescriptor::new(ColumnFamily::BlockMetadata, RocksDbOptions::default());
+            ColumnFamilyDescriptor::new(ColumnFamily::BlockMetadata, Self::cf_options_with_bloom());
         let block_txids_cf =
             ColumnFamilyDescriptor::new(ColumnFamily::BlockTxids, RocksDbOptions::default());
         let inputs_cf =
-            ColumnFamilyDescriptor::new(ColumnFamily::Inputs, RocksDbOptions::default());
+            ColumnFamilyDescriptor::new(ColumnFamily::Inputs, Self::cf_options_with_bloom());
         let outputs_cf =
-            ColumnFamilyDescriptor::new(ColumnFamily::Outputs, RocksDbOptions::default());
-        let tx_cf = ColumnFamilyDescriptor::new(ColumnFamily::Tx, RocksDbOptions::default());
+            ColumnFamilyDescriptor::new(ColumnFamily::Outputs, Self::cf_options_with_bloom());
+        let tx_cf = ColumnFamilyDescriptor::new(ColumnFamily::Tx, Self::cf_options_with_bloom());
 
-        // Configure BlockIndex column family with merge operator for efficient appends
-        let mut block_index_opts = RocksDbOptions::default();
+        // Configure BlockIndex column family with merge operator for efficient appends.
+        // Bloom filter helps point lookups in get_children_blockhashes.
+        let mut block_index_opts = Self::cf_options_with_bloom();
         block_index_opts
             .set_merge_operator_associative("blockhash_list_merge", blockhash_list_merge);
         let block_index_cf =
             ColumnFamilyDescriptor::new(ColumnFamily::BlockIndex, block_index_opts);
 
-        // Configure BlockHeight column family with merge operator for efficient appends
-        let mut block_height_opts = RocksDbOptions::default();
+        // Configure BlockHeight column family with merge operator for efficient appends.
+        // Bloom filter helps point lookups for TOP_CANDIDATE/TOP_CONFIRMED keys.
+        let mut block_height_opts = Self::cf_options_with_bloom();
         block_height_opts
             .set_merge_operator_associative("blockhash_list_merge", blockhash_list_merge);
         let block_height_cf =
@@ -163,22 +169,28 @@ impl Store {
             ColumnFamilyDescriptor::new(ColumnFamily::BitcoinTxids, RocksDbOptions::default());
 
         let share_cf = ColumnFamilyDescriptor::new(ColumnFamily::Share, RocksDbOptions::default());
-        let user_cf = ColumnFamilyDescriptor::new(ColumnFamily::User, RocksDbOptions::default());
+        let user_cf =
+            ColumnFamilyDescriptor::new(ColumnFamily::User, Self::cf_options_with_bloom());
         let user_index_cf =
             ColumnFamilyDescriptor::new(ColumnFamily::UserIndex, RocksDbOptions::default());
         let metadata_cf =
             ColumnFamilyDescriptor::new(ColumnFamily::Metadata, RocksDbOptions::default());
 
         let spends_index_cf =
-            ColumnFamilyDescriptor::new(ColumnFamily::SpendsIndex, RocksDbOptions::default());
+            ColumnFamilyDescriptor::new(ColumnFamily::SpendsIndex, Self::cf_options_with_bloom());
 
         let header_cf =
-            ColumnFamilyDescriptor::new(ColumnFamily::Header, RocksDbOptions::default());
+            ColumnFamilyDescriptor::new(ColumnFamily::Header, Self::cf_options_with_bloom());
 
         let template_merkle_branches_cf = ColumnFamilyDescriptor::new(
             ColumnFamily::TemplateMerkleBranches,
             RocksDbOptions::default(),
         );
+
+        let bitcoin_coinbase_cf =
+            ColumnFamilyDescriptor::new(ColumnFamily::BitcoinCoinbase, RocksDbOptions::default());
+        let found_blocks_cf =
+            ColumnFamilyDescriptor::new(ColumnFamily::FoundBlocks, RocksDbOptions::default());
 
         let cfs = vec![
             block_metadata_cf_descriptor,
@@ -198,6 +210,8 @@ impl Store {
             spends_index_cf,
             header_cf,
             template_merkle_branches_cf,
+            bitcoin_coinbase_cf,
+            found_blocks_cf,
         ];
 
         // for the db too, we use default options for now
@@ -274,9 +288,9 @@ impl Store {
         );
         let height_entries = self.get_blockhashes_for_height_range(start_height, end_height);
 
-        for (height, raw_hashes) in height_entries {
+        for (_height, raw_hashes) in height_entries {
             let mut hashes_at_height: Vec<BlockHash> = self
-                .get_block_metadata_batch(&raw_hashes)
+                .get_block_metadata_batch(&raw_hashes)?
                 .into_iter()
                 .filter(|(_, metadata)| {
                     metadata.status != Status::Pending && metadata.status != Status::Invalid
@@ -339,6 +353,7 @@ impl Store {
             expected_height: Some(0),
             chain_work: genesis_work,
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
         self.update_block_metadata(&blockhash, &metadata, batch)?;
 
@@ -386,25 +401,52 @@ impl Store {
     /// Push a share to the confirmed chain: organise header, store
     /// the full block, then promote candidates to confirmed.
     /// Returns the new confirmed height if changed, or None.
+    ///
+    /// In-PPLNS-zone promotion requires the candidate prefix to be
+    /// BlockValid, so this marks the whole candidate chain validated before
+    /// promoting -- simulating candidates that have completed chain-context
+    /// validation.
     pub fn push_to_confirmed_chain(&self, share: &ShareBlock) -> Result<Option<u32>, StoreError> {
         self.push_to_candidate_chain(share)?;
         let mut batch = Store::get_write_batch();
         self.add_share_block(share, &mut batch)?;
         self.commit_batch(batch)?;
+        self.mark_candidate_chain_block_valid();
         let mut batch = Store::get_write_batch();
         let result = self.organise_block(&mut batch)?;
         self.commit_batch(batch)?;
         Ok(result)
     }
 
+    /// Mark every block currently on the candidate chain BlockValid.
+    ///
+    /// Test helper for promotion scenarios: in-PPLNS-zone confirmation
+    /// requires `is_candidate_and_block_valid`, so tests that build a
+    /// candidate chain and expect it confirmed must first mark it validated.
+    /// Already-BlockValid entries are left unchanged.
+    pub fn mark_candidate_chain_block_valid(&self) {
+        let top = match self.get_top_candidate_height() {
+            Ok(top) => top,
+            Err(_) => return,
+        };
+        let mut batch = Store::get_write_batch();
+        for height in 1..=top {
+            if let Ok(hash) = self.get_candidate_at_height(height) {
+                let _ = self.mark_block_valid(&hash, &mut batch);
+            }
+        }
+        self.commit_batch(batch).unwrap();
+    }
+
     /// Store a share block and create Valid metadata for it.
     ///
     /// Used in tests for shares that need to be discoverable by
     /// forward walks and uncle lookups. The metadata height and
-    /// chain_work are computed from the parent. Panics if the parent
-    /// is not in the store -- missing parent in test setup is a bug.
-    /// Does NOT go through organise_header, so it avoids candidate
-    /// chain side effects.
+    /// chain_work are computed from the parent, with chain_work adding
+    /// uncle work as `initialise_new_header` does. Panics if the parent
+    /// or an uncle header is not in the store -- missing data in test
+    /// setup is a bug. Does NOT go through organise_header, so it avoids
+    /// candidate chain side effects.
     pub fn store_with_valid_metadata(&self, share: &ShareBlock) {
         let blockhash = share.block_hash();
         let share_work = share.header.get_work();
@@ -418,7 +460,8 @@ impl Store {
             });
         let parent_height = parent_metadata.expected_height.unwrap_or_default();
         let height = parent_height + 1;
-        let chain_work = parent_metadata.chain_work + share_work;
+        let uncles_work = self.sum_uncles_work(&share.header, &blockhash).unwrap();
+        let chain_work = parent_metadata.chain_work + share_work + uncles_work;
         let mut batch = Store::get_write_batch();
         self.add_share_block(share, &mut batch).unwrap();
         self.set_height_to_blockhash(&blockhash, height, &mut batch)
@@ -427,6 +470,7 @@ impl Store {
             expected_height: Some(height),
             chain_work,
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
         self.update_block_metadata(&blockhash, &metadata, &mut batch)
             .unwrap();
@@ -436,9 +480,10 @@ impl Store {
     /// Create Valid metadata for a share without storing its block data.
     ///
     /// Also stores the header in the Header CF so that downstream
-    /// children can look up parent timestamps and heights. Panics if
-    /// the parent is not in the store -- missing parent in test setup
-    /// is a bug.
+    /// children can look up parent timestamps and heights. chain_work
+    /// adds uncle work as `initialise_new_header` does. Panics if the
+    /// parent or an uncle header is not in the store -- missing data in
+    /// test setup is a bug.
     pub fn create_valid_metadata_only(&self, share: &ShareBlock) {
         let blockhash = share.block_hash();
         let share_work = share.header.get_work();
@@ -452,7 +497,8 @@ impl Store {
             });
         let parent_height = parent_metadata.expected_height.unwrap_or_default();
         let height = parent_height + 1;
-        let chain_work = parent_metadata.chain_work + share_work;
+        let uncles_work = self.sum_uncles_work(&share.header, &blockhash).unwrap();
+        let chain_work = parent_metadata.chain_work + share_work + uncles_work;
         let mut batch = Store::get_write_batch();
         self.add_share_header(&share.header, &mut batch).unwrap();
         self.set_height_to_blockhash(&blockhash, height, &mut batch)
@@ -461,6 +507,7 @@ impl Store {
             expected_height: Some(height),
             chain_work,
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
         self.update_block_metadata(&blockhash, &metadata, &mut batch)
             .unwrap();
@@ -715,8 +762,7 @@ mod tests {
         assert_eq!(
             hashes.len(),
             2,
-            "Both hashes should survive compaction, got: {:?}",
-            hashes
+            "Both hashes should survive compaction, got: {hashes:?}"
         );
         assert!(hashes.contains(&hash1), "hash1 lost after compaction");
         assert!(hashes.contains(&hash2), "hash2 lost after compaction");

@@ -1,22 +1,10 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::node::SwarmSend;
 use crate::node::messages::{InventoryMessage, Message};
-use crate::node::p2p_message_handlers::senders::send_getheaders;
+use crate::node::p2p_message_handlers::receivers::request_missing_blocks::request_headers_for_missing_blocks;
 #[cfg(test)]
 #[mockall_double::double]
 use crate::shares::chain::chain_store_handle::ChainStoreHandle;
@@ -57,22 +45,8 @@ pub async fn handle_inventory<C: Send + Sync>(
     match inventory {
         InventoryMessage::BlockHashes(blockhashes) => {
             debug!("Received block hashes locator: {:?}", blockhashes);
-
-            if !chain_store_handle.is_current() {
-                debug!("Chain not current, ignoring inv from peer {peer}");
-                return Ok(());
-            }
-
-            let missing_blocks = chain_store_handle.get_missing_blockhashes(&blockhashes);
-
-            if !missing_blocks.is_empty() {
-                debug!(
-                    "Have {} missing blocks from peer {}, sending getheaders",
-                    missing_blocks.len(),
-                    peer
-                );
-                send_getheaders(peer, chain_store_handle, swarm_tx, 0).await?;
-            }
+            request_headers_for_missing_blocks(&blockhashes, peer, chain_store_handle, swarm_tx)
+                .await?;
         }
         InventoryMessage::TransactionHashes(transaction_hashes) => {
             debug!(

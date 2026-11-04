@@ -1,19 +1,8 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod address;
 pub mod api_client;
 pub mod blocked_ips;
 pub mod candidates;
@@ -30,15 +19,17 @@ pub mod shares;
 pub mod transactions;
 
 use crate::commands;
+use bitcoin::Network;
 use clap::{ArgGroup, Parser, Subcommand};
 use p2poolv2_lib::config::Config;
 use std::error::Error;
+use std::path::Path;
 
 /// P2Pool v2 CLI utility
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Path to p2poolv2 config file (not required for gen-auth or --db-path commands)
+    /// Path to p2poolv2 config file (not required for address, gen-auth or --db-path commands)
     #[arg(short, long, env("P2POOL_CONFIG"), global = true)]
     pub config: Option<String>,
 
@@ -137,6 +128,18 @@ pub enum Commands {
         #[command(subcommand)]
         command: DbCommands,
     },
+    /// Print the share chain address for a taproot output key
+    ///
+    /// Takes the `witness_program` field of `bitcoin-cli getaddressinfo`, the
+    /// already tweaked 32 byte taproot output key, in hex. Reads it from stdin
+    /// when no argument is given.
+    Address {
+        /// Taproot output key, hex. Omit to read it from stdin.
+        witness_program: Option<String>,
+        /// Network whose prefix to encode under: main, testnet4, signet or regtest
+        #[arg(short, long, value_parser = commands::address::parse_network)]
+        network: Network,
+    },
     /// Generate API authentication credentials (salt, password, HMAC)
     GenAuth {
         /// Username for API authentication
@@ -188,6 +191,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Commands::Address {
+            witness_program,
+            network,
+        }) => {
+            commands::address::execute(witness_program.clone(), *network)?;
+        }
         Some(Commands::GenAuth { username, password }) => {
             commands::gen_auth::execute(username.clone(), password.clone())?;
         }
@@ -219,6 +228,16 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 // Direct database query mode (offline, no running node required)
                 let store = commands::db_query::open_store(db_path)?;
 
+                // A miner address is stored as the bare witness program it
+                // encodes, so rendering it needs the network. --config is
+                // documented as not required here.
+                let network = match &cli.config {
+                    Some(config_path) if Path::new(config_path).exists() => {
+                        Some(Config::load(config_path)?.stratum.network)
+                    }
+                    _ => None,
+                };
+
                 match &cli.command {
                     Some(Commands::Info) => {
                         commands::db_query::info(&store)?;
@@ -232,23 +251,29 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     }
                     Some(Commands::Shares { to, num, dot, .. }) => {
                         if *dot {
-                            commands::db_query::shares_dot(&store, *to, *num)?;
+                            commands::db_query::shares_dot(&store, *to, *num, network)?;
                         } else {
-                            commands::db_query::shares(&store, *to, *num)?;
+                            commands::db_query::shares(&store, *to, *num, network)?;
                         }
                     }
                     Some(Commands::Candidates { to, num, dot }) => {
                         if *dot {
-                            commands::db_query::candidates_dot(&store, *to, *num)?;
+                            commands::db_query::candidates_dot(&store, *to, *num, network)?;
                         } else {
-                            commands::db_query::candidates(&store, *to, *num)?;
+                            commands::db_query::candidates(&store, *to, *num, network)?;
                         }
                     }
                     Some(Commands::Share { hash, height, full }) => {
-                        commands::db_query::share_lookup(&store, hash.clone(), *height, *full)?;
+                        commands::db_query::share_lookup(
+                            &store,
+                            hash.clone(),
+                            *height,
+                            *full,
+                            network,
+                        )?;
                     }
                     Some(Commands::Dag { to, num, dot }) => {
-                        commands::db_query::dag(&store, *to, *num, *dot)?;
+                        commands::db_query::dag(&store, *to, *num, *dot, network)?;
                     }
                     Some(Commands::Transactions { command }) => {
                         commands::transactions::execute_db(&store, command)?;

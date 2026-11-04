@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[cfg(test)]
 #[mockall_double::double]
@@ -24,21 +12,22 @@ use bitcoin::{CompactTarget, Target};
 use std::error::Error;
 use std::fmt;
 
-uint::construct_uint! {
-    /// 512-bit unsigned integer used as an intermediate type for ASERT target
-    /// arithmetic. Using 512 bits avoids overflow when multiplying a 256-bit
-    /// anchor target by the polynomial factor and applying bit shifts.
-    struct U512(8);
+// The generated arithmetic trips these lints inside the external macro body,
+// where they cannot be fixed. An outer #[allow] on the macro invocation is
+// ignored, so the allow has to be an inner attribute on a wrapping module.
+mod u512 {
+    #![allow(clippy::manual_div_ceil, clippy::assign_op_pattern)]
+
+    uint::construct_uint! {
+        /// 512-bit unsigned integer used as an intermediate type for ASERT target
+        /// arithmetic. Using 512 bits avoids overflow when multiplying a 256-bit
+        /// anchor target by the polynomial factor and applying bit shifts.
+        pub struct U512(8);
+    }
 }
+use u512::U512;
 
-/// Ideal block time for the share chain in seconds (target: one share every 10 seconds)
-const IDEAL_BLOCK_TIME: u32 = 10;
-
-/// Half life for the ASERT algorithm in seconds.
-/// Set to 60 times the ideal block time (60 * 10 = 600 seconds = 10 minutes).
-/// Difficulty halves (or doubles) when blocks are consistently twice as fast
-/// (or slow) as expected over this period.
-const HALFLIFE: u32 = 600;
+use crate::sim_overrides;
 
 /// Maximum (easiest) target as a consensus u32. This is the regtest maximum and
 /// serves as the ceiling for the share chain target. Stored as u32 because
@@ -59,8 +48,7 @@ fn target_to_u512(target: Target) -> U512 {
 /// Convert a `U512` value back to a `Target`, assuming it fits in 256 bits.
 /// The caller must ensure the value has been clamped to the 256-bit range.
 fn u512_to_target(value: U512) -> Target {
-    let mut bytes = [0u8; 64];
-    value.to_little_endian(&mut bytes);
+    let bytes = value.to_little_endian();
     Target::from_le_bytes(bytes[..32].try_into().expect("slice is 32 bytes"))
 }
 
@@ -162,6 +150,30 @@ pub(crate) fn asert_calculate_target(
     result_target.to_compact_lossy()
 }
 
+/// The compact target whose pool difficulty is the steady state for a given
+/// total network hashrate: `D* = hashrate · IDEAL_BLOCK_TIME / 2^32` is the
+/// difficulty at which that hashrate produces one share per target interval.
+///
+/// Sim only: used to anchor the share chain at ~the difficulty ASERT would
+/// settle to, so it starts already regulated instead of climbing from the easy
+/// clamp for ~15-20 min (the half-life). Computed by scaling the clamp target
+/// by `d_clamp / D*` (target ∝ 1/difficulty), which inverts `difficulty_float`
+/// exactly via a known reference target rather than guessing its constant.
+/// Returns the clamp unchanged when the hashrate is too low to exceed the floor.
+pub fn anchor_target_for_network_hashrate(hashrate_hps: f64) -> CompactTarget {
+    let clamp = CompactTarget::from_consensus(MAX_TARGET_CONSENSUS);
+    let d_star =
+        (hashrate_hps * sim_overrides::ideal_block_time() as f64 / 4_294_967_296.0).max(1.0);
+    let d_clamp = Target::from_compact(clamp).difficulty_float();
+    if d_star <= d_clamp {
+        return clamp;
+    }
+    let clamp_wide = target_to_u512(Target::from_compact(clamp));
+    let scaled =
+        clamp_wide * U512::from(d_clamp.round() as u128) / U512::from(d_star.round() as u128);
+    u512_to_target(scaled).to_compact_lossy()
+}
+
 // ---------------------------------------------------------------------------
 // PoolDifficulty -- public API
 // ---------------------------------------------------------------------------
@@ -255,8 +267,8 @@ impl PoolDifficulty {
             self.anchor_target,
             time_delta,
             height_delta,
-            HALFLIFE,
-            IDEAL_BLOCK_TIME,
+            sim_overrides::half_life(),
+            sim_overrides::ideal_block_time(),
         )
     }
 
@@ -723,7 +735,8 @@ mod tests {
         for index in 1..headers.len() {
             let parent_time = headers[index - 1].time;
             let parent_height = (index - 1) as u32;
-            let calculated_bits = pool_difficulty.calculate_target(parent_time, parent_height);
+            let calculated_bits =
+                pool_difficulty.calculate_target_clamped(parent_time, parent_height);
 
             assert_eq!(
                 calculated_bits.to_consensus(),

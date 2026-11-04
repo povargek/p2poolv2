@@ -1,0 +1,122 @@
+---
+# P2Poolv2 role -- install and configure p2poolv2 node
+
+- name: Create p2poolv2 system group
+  ansible.builtin.group:
+    name: "{{ p2poolv2_group }}"
+    system: true
+    state: present
+
+- name: Look up existing p2poolv2 user
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ p2poolv2_user }}"
+    fail_key: false
+
+# usermod refuses to move the home of a user with running processes, so
+# an existing user keeps its home and only the shell is enforced.
+- name: Create p2poolv2 system user
+  ansible.builtin.user:
+    name: "{{ p2poolv2_user }}"
+    group: "{{ p2poolv2_group }}"
+    system: true
+    shell: /bin/false
+    home: "{{ omit if ansible_facts.getent_passwd.get(p2poolv2_user) else '/var/lib/p2poolv2' }}"
+    create_home: false
+
+- name: Create installation directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ p2poolv2_bin_dir }}"
+    - "{{ p2poolv2_static_dir }}"
+
+- name: Create config directory
+  ansible.builtin.file:
+    path: "{{ p2poolv2_config_dir }}"
+    state: directory
+    owner: "{{ p2poolv2_user }}"
+    group: "{{ p2poolv2_group }}"
+    mode: "0750"
+
+- name: Create state directory
+  ansible.builtin.file:
+    path: "/var/lib/p2poolv2/{{ p2poolv2_instance }}"
+    state: directory
+    owner: "{{ p2poolv2_user }}"
+    group: "{{ p2poolv2_group }}"
+    mode: "0750"
+
+- name: Create stats directory
+  ansible.builtin.file:
+    path: "{{ p2poolv2_stats_dir }}"
+    state: directory
+    owner: "{{ p2poolv2_user }}"
+    group: "{{ p2poolv2_group }}"
+    mode: "0750"
+
+# --- Install binaries and dashboard ---
+
+- name: Install p2poolv2 from release
+  ansible.builtin.include_tasks: install_release.yml
+  when: p2poolv2_install_method == "release"
+
+- name: Install p2poolv2 from source
+  ansible.builtin.include_tasks: install_source.yml
+  when: p2poolv2_install_method == "source"
+
+- name: Check bitcoind before (re)starting p2poolv2
+  ansible.builtin.include_tasks: preflight.yml
+
+# --- Deploy configuration ---
+
+- name: Deploy p2poolv2 config
+  ansible.builtin.template:
+    src: config.toml.j2
+    dest: "{{ p2poolv2_config_dir }}/config-{{ p2poolv2_instance }}.toml"
+    owner: "{{ p2poolv2_user }}"
+    group: "{{ p2poolv2_group }}"
+    mode: "0640"
+  register: p2poolv2_config_changed
+
+# --- Deploy systemd unit ---
+
+- name: Deploy systemd template unit
+  ansible.builtin.template:
+    src: p2poolv2@.service.j2
+    dest: /etc/systemd/system/p2poolv2@.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: p2poolv2_unit_changed
+
+# The unit is shared by all instances, so only the first instance in a
+# run sees it change; the fact makes the later ones restart too.
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: p2poolv2_unit_changed.changed
+
+- name: Record unit update for every instance on this host
+  ansible.builtin.set_fact:
+    p2poolv2_unit_updated: true
+  when: p2poolv2_unit_changed.changed
+
+- name: Enable and start p2poolv2 service
+  ansible.builtin.systemd:
+    name: "p2poolv2@{{ p2poolv2_instance }}"
+    enabled: true
+    state: started
+
+- name: Restart p2poolv2 service
+  ansible.builtin.systemd:
+    name: "p2poolv2@{{ p2poolv2_instance }}"
+    state: restarted
+  when: >
+    p2poolv2_binary_updated | default(false) or
+    p2poolv2_unit_updated | default(false) or
+    p2poolv2_config_changed.changed

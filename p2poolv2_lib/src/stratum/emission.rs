@@ -1,40 +1,33 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::accounting::payout::simple_pplns::SimplePplnsShare;
-use crate::shares::extranonce::Extranonce;
+use crate::shares::coinbase_proof::CoinbaseProof;
 use crate::shares::share_commitment::ShareCommitment;
 use crate::stratum::work::block_template::BlockTemplate;
+use bitcoin::Transaction;
 use bitcoin::block::Header;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Shares emitted by stratum and consumed by accounting and p2p
-/// network.
+/// A share emitted by stratum for the share chain.
+///
+/// Only P2Poolv2 mode emits. Hydrapool PPLNS shares go to the PPLNS share
+/// worker instead (`accounting::payout::simple_pplns::share_worker`).
 pub struct Emission {
-    pub pplns: SimplePplnsShare,
     pub header: Header,
     pub blocktemplate: Arc<BlockTemplate>,
-    pub share_commitment: Option<ShareCommitment>,
-    /// Nanosecond timestamp embedded in the coinbase scriptSig.
-    pub coinbase_nsecs: u64,
+    pub share_commitment: ShareCommitment,
     /// Merkle branches for the template transactions (excluding coinbase).
     pub template_merkle_branches: Vec<bitcoin::TxMerkleNode>,
-    /// Combined extranonce (enonce1 || enonce2) from the stratum submission.
-    pub extranonce: Extranonce,
+    /// The bitcoin coinbase the miner hashed, rebuilt from the job and the
+    /// submitted extranonce2. Carried in the share block, where it holds the
+    /// aux flags, extranonce and nanosecond timestamp the header no longer
+    /// does.
+    pub bitcoin_coinbase: Transaction,
+    /// Midstate proof of the commitment in the bitcoin coinbase, built where
+    /// the full coinbase is still in hand, at submission.
+    pub coinbase_proof: CoinbaseProof,
 }
 
 pub type EmissionSender = mpsc::Sender<Emission>;

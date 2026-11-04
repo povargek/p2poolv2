@@ -1,26 +1,14 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::store::block_tx_metadata::Status;
+use crate::store::block_tx_metadata::{ChainMembership, Status};
 use crate::{
     shares::share_block::ShareHeader,
     store::{block_tx_metadata::BlockMetadata, writer::StoreError},
 };
-use bitcoin::BlockHash;
-use tracing::debug;
+use bitcoin::{BlockHash, Work};
+use tracing::{debug, info};
 
 use super::{Height, Store, TopResult};
 
@@ -28,9 +16,8 @@ impl Store {
     /// Organise a share header into the candidate chain.
     ///
     /// Reads block metadata, top candidate, and top confirmed from the store,
-    /// then extends or reorgs the candidate chain as needed. Also marks any
-    /// uncles referenced by the header in the uncles index so that
-    /// find_uncles will not select them again.
+    /// then extends or reorgs the candidate chain as needed. Also records the
+    /// header as the nephew of each uncle it references in the uncles index.
     ///
     /// Returns the new candidate height and chain if the candidate chain
     /// changed, or None if unchanged.
@@ -65,6 +52,12 @@ impl Store {
             }
         };
 
+        // A Confirmed or Invalid block must not be re-organised into the candidate
+        // chain.
+        if metadata.chain == ChainMembership::Confirmed || metadata.status == Status::Invalid {
+            return Ok(None);
+        }
+
         let top_candidate = self.get_top_candidate().ok();
         let Some(top_confirmed) = self.get_top_confirmed().ok() else {
             return Err(StoreError::Database(
@@ -82,6 +75,21 @@ impl Store {
         }
 
         if self.should_reorg_candidate(&blockhash, &metadata, top_candidate.as_ref()) {
+            // Refuse a reorg whose branch descends through an Invalid block.
+            if self.reorg_branch_has_invalid(&blockhash)? {
+                debug!(
+                    "Refusing candidate reorg to {blockhash}: branch passes through an Invalid block"
+                );
+                return Ok(None);
+            }
+            // Refuse a reorg forking below the prune target: its fork point's
+            // body is deleted, so it could never be confirmed.
+            if self.reorg_branch_forks_below_prune_target(&blockhash)? {
+                info!(
+                    "Refusing candidate reorg to {blockhash}: branch forks below the prune target"
+                );
+                return Ok(None);
+            }
             return self.reorg_candidate_chain(&blockhash, top_candidate.as_ref(), batch);
         }
 
@@ -106,6 +114,7 @@ impl Store {
             blockhash,
             &mut new_entries,
             batch,
+            None,
         )?;
         debug!("new candidate height after extending candidates {final_height}");
         Ok(Some(final_height))
@@ -129,6 +138,7 @@ impl Store {
             &reorg_tip_hash,
             &mut new_entries,
             batch,
+            None,
         )?;
         debug!("new candidate height after reorg + forward walk {final_height}");
         Ok(Some(final_height))
@@ -171,6 +181,10 @@ impl Store {
     /// Stores the header, computes height and chain work from the
     /// parent, records uncle references in the block and uncles
     /// indexes, and writes initial metadata with HeaderValid status.
+    ///
+    /// Chain work is the parent's chain work plus the header's own work plus
+    /// the own work of each uncle it lists. Errors if the parent or any uncle
+    /// header is not in the store.
     fn initialise_new_header(
         &self,
         header: &ShareHeader,
@@ -196,7 +210,8 @@ impl Store {
             ))
         })?;
         let new_height = prev_height + 1;
-        let new_chain_work = prev_metadata.chain_work + share_work;
+        let uncles_work = self.sum_uncles_work(header, blockhash)?;
+        let new_chain_work = prev_metadata.chain_work + share_work + uncles_work;
 
         for uncle_blockhash in &header.uncles {
             self.update_block_index(uncle_blockhash, blockhash, batch)?;
@@ -208,10 +223,33 @@ impl Store {
             expected_height: Some(new_height),
             chain_work: new_chain_work,
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
         self.update_block_metadata(blockhash, &metadata, batch)?;
 
         Ok(metadata)
+    }
+
+    /// Sum the own work of the uncles listed by `header`, reading their
+    /// headers in one batch. Only each uncle's own work counts, not the work
+    /// of its uncles, so every uncle is counted once per chain.
+    ///
+    /// Errors if any uncle header is not in the store.
+    pub(crate) fn sum_uncles_work(
+        &self,
+        header: &ShareHeader,
+        blockhash: &BlockHash,
+    ) -> Result<Work, StoreError> {
+        let uncle_headers = self.get_share_headers(&header.uncles)?;
+        if uncle_headers.len() != header.uncles.len() {
+            return Err(StoreError::NotFound(format!(
+                "Uncle header not found for block {blockhash}"
+            )));
+        }
+        Ok(uncle_headers.iter().fold(
+            Work::from_be_bytes([0u8; 32]),
+            |total, (_, uncle_header)| total + uncle_header.get_work(),
+        ))
     }
 }
 
@@ -367,6 +405,7 @@ mod tests {
                 expected_height: Some(height),
                 chain_work,
                 status: Status::HeaderValid,
+                chain: ChainMembership::None,
             };
             store
                 .update_block_metadata(&blockhash, &metadata, &mut batch)
@@ -389,13 +428,119 @@ mod tests {
         assert_eq!(top.hash, fork_share.block_hash());
     }
 
-    /// Organising a header that references uncles should mark those
-    /// uncles in the uncles index so find_uncles excludes them later.
+    /// A share's chain work includes the work of the uncles it lists, so a
+    /// chain is weighed by all the work it references.
+    ///
+    /// Scenario: genesis -> share1(h:1) -> share2(h:2), with uncle_block
+    /// (work 2) as a fork child of genesis at h:1, listed by share2.
+    #[test]
+    fn test_organise_header_chain_work_includes_uncle_work() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.push_to_candidate_chain(&share1).unwrap();
+
+        let uncle_block = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .work(2)
+            .nonce(0xe9695799)
+            .build();
+        store.store_with_valid_metadata(&uncle_block);
+
+        let share2 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share1.block_hash().to_string())
+            .uncles(vec![uncle_block.block_hash()])
+            .nonce(0xe9695793)
+            .build();
+        store.push_to_candidate_chain(&share2).unwrap();
+
+        let expected_work = genesis.header.get_work()
+            + share1.header.get_work()
+            + share2.header.get_work()
+            + uncle_block.header.get_work();
+        assert_eq!(
+            store
+                .get_block_metadata(&share2.block_hash())
+                .unwrap()
+                .chain_work,
+            expected_work
+        );
+    }
+
+    /// Fork choice weighs uncle work: a branch with less work on its main
+    /// line but more total work once uncles count becomes the candidate tip.
+    ///
+    /// Scenario: genesis -> share1(h:1), uncle_block (work 2) as a fork
+    /// child of genesis at h:1. heavy_share (work 2) extends share1 and
+    /// becomes the candidate tip. light_share (work 1) also extends share1
+    /// and lists uncle_block. Both branches share genesis -> share1, so they
+    /// differ only at h:2. On the main line alone light_share's branch has
+    /// less work (1 < 2), but counting its uncle it has more (1 + 2 > 2).
+    #[test]
+    fn test_organise_header_reorgs_to_branch_with_more_uncle_work() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share1 = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.push_to_candidate_chain(&share1).unwrap();
+
+        let uncle_block = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .work(2)
+            .nonce(0xe9695799)
+            .build();
+        store.store_with_valid_metadata(&uncle_block);
+
+        let heavy_share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share1.block_hash().to_string())
+            .work(2)
+            .nonce(0xe9695793)
+            .build();
+        store.push_to_candidate_chain(&heavy_share).unwrap();
+        assert_eq!(
+            store.get_top_candidate().unwrap().hash,
+            heavy_share.block_hash()
+        );
+
+        let light_share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share1.block_hash().to_string())
+            .uncles(vec![uncle_block.block_hash()])
+            .nonce(0xe9695794)
+            .build();
+
+        let result = store.push_to_candidate_chain(&light_share).unwrap();
+
+        assert!(result.is_some());
+        assert_eq!(
+            store.get_top_candidate().unwrap().hash,
+            light_share.block_hash()
+        );
+    }
+
+    /// Organising a header that references uncles should record the
+    /// nephew for each of those uncles in the uncles index.
     ///
     /// Scenario: genesis -> share1(h:1, confirmed) with uncle_block as
     /// a fork at h:1. share2(h:2) includes uncle_block as an uncle.
-    /// After organising share2, uncle_block should be marked as already
-    /// used in the uncles index.
+    /// After organising share2, the uncles index should list share2 as
+    /// uncle_block's nephew.
     #[test]
     fn test_organise_header_marks_uncles_in_uncles_index() {
         let temp_dir = tempdir().unwrap();
@@ -420,8 +565,8 @@ mod tests {
             .build();
         store.store_with_valid_metadata(&uncle_block);
 
-        // uncle_block should not be marked as uncle yet
-        assert!(!store.is_already_uncle(&uncle_block.block_hash()));
+        // uncle_block should have no nephews yet
+        assert!(store.get_nephews(&uncle_block.block_hash()).is_none());
 
         // share2: child of share1, includes uncle_block as uncle
         let share2 = TestShareBlockBuilder::new()
@@ -437,17 +582,14 @@ mod tests {
         store.organise_header(&share2.header, &mut batch).unwrap();
         store.commit_batch(batch).unwrap();
 
-        // uncle_block should now be marked in the uncles index
-        assert!(store.is_already_uncle(&uncle_block.block_hash()));
-
         // The nephew recorded for uncle_block should be share2
         let nephews = store.get_nephews(&uncle_block.block_hash()).unwrap();
         assert_eq!(nephews.len(), 1);
         assert_eq!(nephews[0], share2.block_hash());
     }
 
-    /// Organising a header with multiple uncles should mark all of them
-    /// in the uncles index.
+    /// Organising a header with multiple uncles should record the nephew
+    /// for all of them in the uncles index.
     #[test]
     fn test_organise_header_marks_multiple_uncles() {
         let temp_dir = tempdir().unwrap();
@@ -476,8 +618,8 @@ mod tests {
         store.store_with_valid_metadata(&uncle_a);
         store.store_with_valid_metadata(&uncle_b);
 
-        assert!(!store.is_already_uncle(&uncle_a.block_hash()));
-        assert!(!store.is_already_uncle(&uncle_b.block_hash()));
+        assert!(store.get_nephews(&uncle_a.block_hash()).is_none());
+        assert!(store.get_nephews(&uncle_b.block_hash()).is_none());
 
         // share2 includes both uncles
         let share2 = TestShareBlockBuilder::new()
@@ -493,9 +635,15 @@ mod tests {
         store.organise_header(&share2.header, &mut batch).unwrap();
         store.commit_batch(batch).unwrap();
 
-        // Both uncles should be marked
-        assert!(store.is_already_uncle(&uncle_a.block_hash()));
-        assert!(store.is_already_uncle(&uncle_b.block_hash()));
+        // Both uncles should list share2 as their nephew
+        assert_eq!(
+            store.get_nephews(&uncle_a.block_hash()),
+            Some(vec![share2.block_hash()])
+        );
+        assert_eq!(
+            store.get_nephews(&uncle_b.block_hash()),
+            Some(vec![share2.block_hash()])
+        );
     }
 
     /// After organising a header with uncles, find_uncles should no
@@ -540,9 +688,9 @@ mod tests {
             .build();
         store.push_to_confirmed_chain(&share3).unwrap();
 
-        // find_uncles should not return uncle_block since share2
-        // already included it and organise_header marked it
-        let uncles = store.find_uncles().unwrap();
+        // find_uncles should not return uncle_block since share2, an
+        // ancestor of the new share, already lists it
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
         assert!(
             !uncles.contains(&uncle_block.block_hash()),
             "uncle_block should be excluded after being included by share2"
@@ -636,6 +784,7 @@ mod tests {
                 expected_height: Some(height),
                 chain_work,
                 status: Status::HeaderValid,
+                chain: ChainMembership::None,
             };
             store
                 .update_block_metadata(&blockhash, &metadata, &mut batch)
@@ -691,7 +840,7 @@ mod tests {
 
         assert!(store.is_confirmed(&share1.block_hash()));
         let metadata_before = store.get_block_metadata(&share1.block_hash()).unwrap();
-        assert_eq!(metadata_before.status, Status::Confirmed);
+        assert_eq!(metadata_before.chain, ChainMembership::Confirmed);
 
         // Re-organise the already-confirmed header, simulating what
         // happens when synced headers from a peer include share1.
@@ -705,9 +854,9 @@ mod tests {
         // share1 must still be Confirmed, not downgraded
         let metadata_after = store.get_block_metadata(&share1.block_hash()).unwrap();
         assert_eq!(
-            metadata_after.status,
-            Status::Confirmed,
-            "organise_header must not overwrite Confirmed status"
+            metadata_after.chain,
+            ChainMembership::Confirmed,
+            "organise_header must not overwrite Confirmed chain membership"
         );
         assert!(store.is_confirmed(&share1.block_hash()));
     }
@@ -755,7 +904,7 @@ mod tests {
         );
 
         // find_uncles must not return share1
-        let uncles = store.find_uncles().unwrap();
+        let uncles = store.find_uncles(&store.get_chain_tip().unwrap()).unwrap();
         assert!(
             !uncles.contains(&share1.block_hash()),
             "confirmed share1 must not appear as uncle after re-organise"
@@ -790,6 +939,7 @@ mod tests {
             expected_height: Some(1),
             chain_work,
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
         let mut batch = Store::get_write_batch();
         store.add_share_header(&share.header, &mut batch).unwrap();
@@ -885,6 +1035,7 @@ mod tests {
             expected_height: None,
             chain_work: share.header.get_work(),
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
         let mut batch = Store::get_write_batch();
         store.add_share_header(&share.header, &mut batch).unwrap();
@@ -898,5 +1049,189 @@ mod tests {
         let result = store.organise_header(&share.header, &mut batch);
         store.commit_batch(batch).unwrap();
         assert!(result.is_ok());
+    }
+
+    /// A reorg whose branch descends through an Invalid block must be refused,
+    /// so the Invalid block is never re-admitted to the candidate chain.
+    ///
+    /// Layout: genesis(confirmed) -> share_s(candidate h1) is the valid chain.
+    /// share_a(h1, Invalid, detached) is a sibling; share_b(h2) is share_a's
+    /// heavier child. Organising share_b's header makes should_reorg_candidate
+    /// fire (share_b outweighs share_s), but the branch share_b -> share_a ->
+    /// genesis passes through Invalid share_a, so the reorg is refused.
+    ///
+    /// Fail-first: before the fix, reorg_candidate re-wrote share_a (and
+    /// share_b) as candidates because get_branch_to_chain walks straight through
+    /// a detached Invalid block.
+    #[test]
+    fn test_organise_header_refuses_reorg_through_invalid_block() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // share_s: valid candidate chain at h1.
+        let share_s = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.push_to_candidate_chain(&share_s).unwrap();
+
+        // share_a: sibling of share_s at h1, Invalid and detached (chain = None).
+        let share_a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695793)
+            .build();
+        let genesis_meta = store.get_block_metadata(&genesis.block_hash()).unwrap();
+        let a_work = genesis_meta.chain_work + share_a.header.get_work();
+        let mut batch = Store::get_write_batch();
+        store.add_share_block(&share_a, &mut batch).unwrap();
+        store
+            .set_height_to_blockhash(&share_a.block_hash(), 1, &mut batch)
+            .unwrap();
+        store
+            .update_block_metadata(
+                &share_a.block_hash(),
+                &BlockMetadata {
+                    expected_height: Some(1),
+                    chain_work: a_work,
+                    status: Status::Invalid,
+                    chain: ChainMembership::None,
+                },
+                &mut batch,
+            )
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // share_b: child of share_a at h2 with more cumulative work than
+        // share_s, so it triggers a reorg. Stored HeaderValid and detached.
+        let share_b = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share_a.block_hash().to_string())
+            .work(2)
+            .nonce(0xe9695794)
+            .build();
+        let b_work = a_work + share_b.header.get_work();
+        let mut batch = Store::get_write_batch();
+        store.add_share_block(&share_b, &mut batch).unwrap();
+        store
+            .set_height_to_blockhash(&share_b.block_hash(), 2, &mut batch)
+            .unwrap();
+        store
+            .update_block_metadata(
+                &share_b.block_hash(),
+                &BlockMetadata {
+                    expected_height: Some(2),
+                    chain_work: b_work,
+                    status: Status::HeaderValid,
+                    chain: ChainMembership::None,
+                },
+                &mut batch,
+            )
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // Organise share_b's header: the reorg must be refused.
+        let mut batch = Store::get_write_batch();
+        let result = store.organise_header(&share_b.header, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert!(
+            result.is_none(),
+            "reorg through Invalid share_a must be refused"
+        );
+
+        // share_a stays Invalid and off the candidate chain; share_b is not admitted.
+        let a_meta = store.get_block_metadata(&share_a.block_hash()).unwrap();
+        assert_eq!(a_meta.status, Status::Invalid);
+        assert_ne!(a_meta.chain, ChainMembership::Candidate);
+        assert_ne!(
+            store
+                .get_block_metadata(&share_b.block_hash())
+                .unwrap()
+                .chain,
+            ChainMembership::Candidate
+        );
+
+        // Candidate tip is unchanged (still share_s at h1).
+        assert_eq!(
+            store.get_top_candidate().unwrap().hash,
+            share_s.block_hash()
+        );
+    }
+
+    /// An Invalid block re-gossiped as a header must not re-enter the candidate
+    /// chain via the extend path.
+    ///
+    /// Layout: genesis(confirmed) -> share_p(candidate h1). share_a(h2) is
+    /// share_p's child that was invalidated and detached. Re-organising
+    /// share_a's header would otherwise extend the candidate chain (its parent
+    /// share_p is the top candidate); the Invalid-status guard refuses it.
+    ///
+    /// Fail-first: before the fix the guard only checked Confirmed, so
+    /// should_extend_candidates re-admitted share_a.
+    #[test]
+    fn test_organise_header_refuses_extend_of_invalid_block() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // share_p: candidate tip at h1.
+        let share_p = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.push_to_candidate_chain(&share_p).unwrap();
+
+        // share_a: child of share_p at h2, invalidated and detached, but heavier
+        // than share_p so it would extend the candidate chain without the guard.
+        let share_a = TestShareBlockBuilder::new()
+            .prev_share_blockhash(share_p.block_hash().to_string())
+            .work(2)
+            .nonce(0xe9695793)
+            .build();
+        let p_meta = store.get_block_metadata(&share_p.block_hash()).unwrap();
+        let a_work = p_meta.chain_work + share_a.header.get_work();
+        let mut batch = Store::get_write_batch();
+        store.add_share_block(&share_a, &mut batch).unwrap();
+        store
+            .set_height_to_blockhash(&share_a.block_hash(), 2, &mut batch)
+            .unwrap();
+        store
+            .update_block_metadata(
+                &share_a.block_hash(),
+                &BlockMetadata {
+                    expected_height: Some(2),
+                    chain_work: a_work,
+                    status: Status::Invalid,
+                    chain: ChainMembership::None,
+                },
+                &mut batch,
+            )
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let mut batch = Store::get_write_batch();
+        let result = store.organise_header(&share_a.header, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert!(
+            result.is_none(),
+            "extending with Invalid share_a must be refused"
+        );
+        let a_meta = store.get_block_metadata(&share_a.block_hash()).unwrap();
+        assert_eq!(a_meta.status, Status::Invalid);
+        assert_ne!(a_meta.chain, ChainMembership::Candidate);
+        // Candidate tip unchanged (still share_p at h1).
+        assert_eq!(
+            store.get_top_candidate().unwrap().hash,
+            share_p.block_hash()
+        );
     }
 }

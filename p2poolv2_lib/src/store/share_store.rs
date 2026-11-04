@@ -1,25 +1,17 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::block_tx_metadata::BlockMetadata;
 use super::{ColumnFamily, Store, writer::StoreError};
 use crate::shares::share_block::{
-    MerkleBranches, ShareBlock, ShareHeader, ShareTransaction, Txids,
+    MerkleBranches, ShareBlock, ShareHeader, ShareTransaction, Txids, is_terminal_blockhash,
 };
+use crate::store::block_tx_metadata::ChainMembership;
+use crate::store::block_tx_metadata::Status::{BlockValid, HeaderValid, Invalid, Pending};
+use crate::store::transaction_store::{BLOCK_TXIDS_SUFFIX, txids_key};
 use bitcoin::BlockHash;
+use bitcoin::Transaction;
 use bitcoin::TxMerkleNode;
 use bitcoin::consensus::{self, Encodable, encode};
 use std::collections::{HashMap, HashSet};
@@ -29,10 +21,13 @@ impl Store {
     /// Add a share to the store.
     ///
     /// Returns early if the block already exists (duplicate guard).
+    /// Returns `StoreError::BelowPruneHeight` for a block below the prune
+    /// target, whose body would be deleted again; this also closes the race
+    /// between a block passing the receiver's check and a prune committing.
     /// Stores the header in the Header CF, transaction indexes in
-    /// BlockTxids CF, and template merkle branches in
-    /// TemplateMerkleBranches CF. All writes are done in a single
-    /// atomic batch.
+    /// BlockTxids CF, template merkle branches in TemplateMerkleBranches
+    /// CF, and the bitcoin coinbase in BitcoinCoinbase CF. All writes are
+    /// done in a single atomic batch.
     pub fn add_share_block(
         &self,
         share: &ShareBlock,
@@ -53,8 +48,14 @@ impl Store {
             share.header.get_work()
         );
 
+        let block_height =
+            self.compute_block_height_from_parent(&share.header.prev_share_blockhash)?;
+        if block_height < self.prune_target()? {
+            return Err(StoreError::BelowPruneHeight(blockhash));
+        }
+
         // Store transactions and get their metadata
-        let txs_metadata = self.add_sharechain_txs(&share.transactions, batch)?;
+        let txs_metadata = self.add_sharechain_txs(&share.transactions, block_height, batch)?;
 
         let txids = Txids(txs_metadata.iter().map(|t| t.txid).collect());
         // Store block -> txids index
@@ -62,7 +63,7 @@ impl Store {
             &blockhash,
             &txids,
             batch,
-            b"_txids",
+            BLOCK_TXIDS_SUFFIX,
             ColumnFamily::BlockTxids,
         )?;
 
@@ -72,6 +73,8 @@ impl Store {
         let branches = MerkleBranches(share.template_merkle_branches.clone());
         self.add_template_merkle_branches(&blockhash, &branches, batch)?;
 
+        self.add_bitcoin_coinbase(&blockhash, &share.bitcoin_coinbase, batch)?;
+
         // Update block index for parent
         self.update_block_index(&share.header.prev_share_blockhash, &blockhash, batch)?;
 
@@ -79,6 +82,34 @@ impl Store {
         self.add_share_header(&share.header, batch)?;
 
         Ok(())
+    }
+
+    /// Compute the block height from the parent's metadata.
+    ///
+    /// Genesis (parent all-zeros) has height 0. For all other blocks,
+    /// returns an error if parent metadata is missing to avoid
+    /// permanently persisting height 0 which would make outputs
+    /// unspendable once the chain tip advances.
+    fn compute_block_height_from_parent(
+        &self,
+        parent_blockhash: &BlockHash,
+    ) -> Result<u32, StoreError> {
+        if is_terminal_blockhash(parent_blockhash) {
+            return Ok(0);
+        }
+        let parent_metadata = self.get_block_metadata(parent_blockhash).map_err(|error| {
+            StoreError::NotFound(format!(
+                "Parent {parent_blockhash} metadata not found for coinbase_root_height: {error}",
+            ))
+        })?;
+        parent_metadata
+            .expected_height
+            .map(|height| height + 1)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "Parent {parent_blockhash} has no expected_height for coinbase_root_height",
+                ))
+            })
     }
 
     /// Store a share header in the dedicated Header column family.
@@ -96,6 +127,20 @@ impl Store {
         let mut encoded_header = Vec::new();
         header.consensus_encode(&mut encoded_header)?;
         batch.put_cf::<&[u8], Vec<u8>>(&header_cf, blockhash.as_ref(), encoded_header);
+        Ok(())
+    }
+
+    /// Store the coinbase merkle branches of headers received without their
+    /// bodies, so the node can serve those headers on: a header is only
+    /// accepted with the branch its coinbase proof is checked against.
+    pub(crate) fn add_header_template_merkle_branches(
+        &self,
+        entries: &[(BlockHash, Vec<TxMerkleNode>)],
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), StoreError> {
+        for (blockhash, branches) in entries {
+            self.add_template_merkle_branches(blockhash, &MerkleBranches(branches.clone()), batch)?;
+        }
         Ok(())
     }
 
@@ -118,6 +163,41 @@ impl Store {
         branches.consensus_encode(&mut value)?;
         batch.put_cf::<&[u8], Vec<u8>>(&column_family, &key, value);
         Ok(())
+    }
+
+    /// Store the bitcoin coinbase a share block carries, keyed by the
+    /// consensus-serialized blockhash.
+    fn add_bitcoin_coinbase(
+        &self,
+        blockhash: &BlockHash,
+        bitcoin_coinbase: &Transaction,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), StoreError> {
+        let column_family = self.db.cf_handle(&ColumnFamily::BitcoinCoinbase).unwrap();
+        let key = consensus::serialize(blockhash);
+        batch.put_cf::<&[u8], Vec<u8>>(
+            &column_family,
+            &key,
+            consensus::serialize(bitcoin_coinbase),
+        );
+        Ok(())
+    }
+
+    /// Retrieve the bitcoin coinbase of a stored share block.
+    ///
+    /// Returns `None` when no coinbase is stored, which is the case for a
+    /// header held without its body.
+    pub fn get_bitcoin_coinbase(
+        &self,
+        blockhash: &BlockHash,
+    ) -> Result<Option<Transaction>, StoreError> {
+        let column_family = self.db.cf_handle(&ColumnFamily::BitcoinCoinbase).unwrap();
+        let key = consensus::serialize(blockhash);
+        match self.db.get_cf::<&[u8]>(&column_family, &key) {
+            Ok(Some(data)) => Ok(Some(encode::deserialize::<Transaction>(&data)?)),
+            Ok(None) => Ok(None),
+            Err(error) => Err(StoreError::Database(error.to_string())),
+        }
     }
 
     /// Retrieve template merkle branches for a share block.
@@ -171,8 +251,7 @@ impl Store {
     /// TODO: Replace this with a has_block field in metadata. Will require migration, so pending till we add migration support. See `missing_share_blocks`.
     pub fn share_block_exists(&self, blockhash: &BlockHash) -> bool {
         let block_txids_cf = self.db.cf_handle(&ColumnFamily::BlockTxids).unwrap();
-        let mut key = consensus::serialize(blockhash);
-        key.extend_from_slice(b"_txids");
+        let key = txids_key(blockhash, BLOCK_TXIDS_SUFFIX);
         self.db
             .get_cf::<&[u8]>(&block_txids_cf, &key)
             .ok()
@@ -188,16 +267,12 @@ impl Store {
         let block_txids_cf = self.db.cf_handle(&ColumnFamily::BlockTxids).unwrap();
         let keys: Vec<_> = blockhashes
             .iter()
-            .map(|hash| {
-                let mut key = consensus::serialize(hash);
-                key.extend_from_slice(b"_txids");
-                (&block_txids_cf, key)
-            })
+            .map(|hash| (&block_txids_cf, txids_key(hash, BLOCK_TXIDS_SUFFIX)))
             .collect();
         let results = self.db.multi_get_cf(keys);
 
         let mut missing = Vec::new();
-        for (blockhash, result) in blockhashes.iter().zip(results.into_iter()) {
+        for (blockhash, result) in blockhashes.iter().zip(results) {
             if !matches!(result, Ok(Some(_))) {
                 missing.push(*blockhash);
             }
@@ -208,7 +283,7 @@ impl Store {
     /// Get a share from the store by reconstructing it from the Header CF
     /// and transaction CFs.
     ///
-    /// Returns None if the header or txids are missing.
+    /// Returns None if the header, txids or bitcoin coinbase are missing.
     pub fn get_share(&self, blockhash: &BlockHash) -> Option<ShareBlock> {
         let header = match self.get_share_header(blockhash) {
             Ok(Some(header)) => header,
@@ -223,10 +298,12 @@ impl Store {
             .map(ShareTransaction)
             .collect();
         let template_merkle_branches = self.get_template_merkle_branches(blockhash).ok()?;
+        let bitcoin_coinbase = self.get_bitcoin_coinbase(blockhash).ok()??;
         Some(ShareBlock {
             header,
             transactions,
             template_merkle_branches,
+            bitcoin_coinbase,
         })
     }
 
@@ -252,11 +329,11 @@ impl Store {
             .collect::<Vec<_>>();
         let results = self.db.multi_get_cf(keys);
         let mut share_headers = Vec::with_capacity(blockhashes.len());
-        for (blockhash, result) in blockhashes.iter().zip(results.into_iter()) {
-            if let Ok(Some(data)) = result {
-                if let Ok(header) = encode::deserialize::<ShareHeader>(&data) {
-                    share_headers.push((*blockhash, header));
-                }
+        for (blockhash, result) in blockhashes.iter().zip(results) {
+            if let Ok(Some(data)) = result
+                && let Ok(header) = encode::deserialize::<ShareHeader>(&data)
+            {
+                share_headers.push((*blockhash, header));
             }
         }
         Ok(share_headers)
@@ -273,17 +350,12 @@ impl Store {
             .map(|hash| (&header_cf, consensus::serialize(hash)))
             .collect::<Vec<_>>();
         let results = self.db.multi_get_cf(keys);
-        for (blockhash, result) in blockhashes.iter().zip(results.into_iter()) {
+        for (blockhash, result) in blockhashes.iter().zip(results) {
             if let Ok(Some(_)) = result {
                 return Some(*blockhash);
             }
         }
         None
-    }
-
-    /// Find the first blockhash that exists by checking the Header CF.
-    pub(crate) fn get_first_existing_blockhash(&self, locator: &[BlockHash]) -> Option<BlockHash> {
-        self.first_existing_share_header(locator)
     }
 
     /// Get multiple shares from the store by reconstructing each from
@@ -394,6 +466,16 @@ impl Store {
         self.get_shares(&blockhashes)
     }
 
+    /// Get the expected height for a block from its metadata.
+    ///
+    /// Returns an error if metadata is missing or has no expected_height.
+    pub fn get_block_height_from_metadata(&self, blockhash: &BlockHash) -> Result<u32, StoreError> {
+        let metadata = self.get_block_metadata(blockhash)?;
+        metadata.expected_height.ok_or_else(|| {
+            StoreError::NotFound(format!("Block {blockhash} has no expected_height"))
+        })
+    }
+
     /// Get the block metadata for a blockhash
     pub fn get_block_metadata(&self, blockhash: &BlockHash) -> Result<BlockMetadata, StoreError> {
         let block_metadata_cf = self.db.cf_handle(&ColumnFamily::BlockMetadata).unwrap();
@@ -412,17 +494,24 @@ impl Store {
         }
     }
 
-    /// Batch fetch block metadata for multiple blockhashes using multi_get_cf.
-    ///
-    /// Returns (BlockHash, BlockMetadata) pairs, silently skipping any
-    /// blockhashes whose metadata is not found or fails to deserialize.
-    /// Batch-fetch block metadata for the given blockhashes.
+    /// Batch-fetch block metadata for the given blockhashes using multi_get_cf.
     ///
     /// Deduplicates the input so each blockhash is looked up at most once.
+    ///
+    /// A blockhash with no metadata row is omitted from the result rather than
+    /// reported: for most callers that is the answer they are asking for -- an
+    /// unknown parent during header sync, a block that is not yet valid, an
+    /// uncle with no height. Callers for which an unknown block is a fault must
+    /// compare the result against what they asked for; see
+    /// `all_in_zone_blocks_block_valid`.
+    ///
+    /// A read that fails, or a row that will not deserialize, is a different
+    /// thing entirely and comes back as `Err`. Folding those in with absence
+    /// let a disk fault or a corrupt row read as a fact about the chain.
     pub fn get_block_metadata_batch(
         &self,
         blockhashes: &[BlockHash],
-    ) -> Vec<(BlockHash, BlockMetadata)> {
+    ) -> Result<Vec<(BlockHash, BlockMetadata)>, StoreError> {
         let mut seen = HashSet::with_capacity(blockhashes.len());
         let unique_blockhashes: Vec<BlockHash> = blockhashes
             .iter()
@@ -437,14 +526,18 @@ impl Store {
             .collect();
         let results = self.db.multi_get_cf(keys);
         let mut metadata_results = Vec::with_capacity(unique_blockhashes.len());
-        for (blockhash, result) in unique_blockhashes.iter().zip(results.into_iter()) {
-            if let Ok(Some(data)) = result {
-                if let Ok(metadata) = encode::deserialize::<BlockMetadata>(&data) {
-                    metadata_results.push((*blockhash, metadata));
-                }
-            }
+        for (blockhash, result) in unique_blockhashes.iter().zip(results) {
+            let Some(data) = result? else {
+                continue;
+            };
+            let metadata = encode::deserialize::<BlockMetadata>(&data).map_err(|error| {
+                StoreError::Serialization(format!(
+                    "Failed to deserialize metadata for {blockhash}: {error}"
+                ))
+            })?;
+            metadata_results.push((*blockhash, metadata));
         }
-        metadata_results
+        Ok(metadata_results)
     }
 
     /// Check which blockhashes from the provided list are missing from the store.
@@ -475,6 +568,81 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a block Invalid so it is never promoted to confirmed (see
+    /// organise_block's Invalid gate). Called when chain-context validation
+    /// fails. A no-op only when the block is on the confirmed chain -- a
+    /// finalized block must not be downgraded on a later (possibly transient)
+    /// failure. A block on the candidate chain (or off-chain) can now be
+    /// invalidated even if it was previously `BlockValid`, because validation
+    /// state is tracked independently of chain membership. Errors if the block
+    /// has no metadata.
+    ///
+    /// When the block was on the candidate chain, invalidating it also
+    /// reorgs the candidate chain: the block and its candidate descendants
+    /// leave the chain and the best surviving branch is rebuilt from the
+    /// block's parent (see `reorg_candidate_after_invalidation`).
+    ///
+    /// `pending_confirmed_top` is the confirmed top this batch has already
+    /// queued, or `None` when the batch leaves the confirmed chain alone.
+    pub fn mark_invalid(
+        &self,
+        blockhash: &BlockHash,
+        pending_confirmed_top: Option<u32>,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), StoreError> {
+        let mut metadata = self.get_block_metadata(blockhash)?;
+        // Confired blocks can't be marked invalid
+        if metadata.chain == ChainMembership::Confirmed {
+            return Ok(());
+        }
+        let was_candidate = metadata.chain == ChainMembership::Candidate;
+        metadata.status = Invalid;
+        metadata.chain = ChainMembership::None;
+        self.update_block_metadata(blockhash, &metadata, batch)?;
+        if was_candidate {
+            let confirmed_top = match pending_confirmed_top {
+                Some(height) => height,
+                None => self.get_top_confirmed_height()?,
+            };
+            self.reorg_candidate_after_invalidation(blockhash, &metadata, confirmed_top, batch)?;
+        }
+        Ok(())
+    }
+
+    /// Mark a block BlockValid after it passes chain-context validation.
+    ///
+    /// Upgrades a HeaderValid block to BlockValid. An already-BlockValid
+    /// block is an idempotent no-op. A Pending or Invalid block is a
+    /// precondition violation -- block validation must run on a
+    /// header-validated, not-yet-rejected block -- and returns
+    /// `StoreError::InvalidStatusTransition` rather than silently succeeding.
+    ///
+    /// Chain membership is a separate field, so this never affects
+    /// candidate/confirmed position. Errors if the block has no metadata.
+    pub fn mark_block_valid(
+        &self,
+        blockhash: &BlockHash,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), StoreError> {
+        let mut metadata = self.get_block_metadata(blockhash)?;
+        match metadata.status {
+            HeaderValid => {
+                metadata.status = BlockValid;
+                self.update_block_metadata(blockhash, &metadata, batch)?;
+                Ok(())
+            }
+            // Already validated: idempotent no-op.
+            BlockValid => Ok(()),
+            // Pending (header never validated) or Invalid (already rejected)
+            // both violate the precondition that block validation runs on a
+            // header-valid block. Surface it instead of silently succeeding.
+            Pending | Invalid => Err(StoreError::InvalidStatusTransition(format!(
+                "Cannot mark block {blockhash} BlockValid from status {:?}",
+                metadata.status
+            ))),
+        }
+    }
+
     /// Get a share header from the Header column family.
     pub fn get_share_header(
         &self,
@@ -494,12 +662,252 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::block_tx_metadata::{BlockMetadata, Status};
+    use crate::store::block_tx_metadata::{BlockMetadata, ChainMembership, Status};
     use crate::test_utils::TestShareBlockBuilder;
     use bitcoin::TxMerkleNode;
     use bitcoin::Work;
     use bitcoin::hashes::Hash;
     use tempfile::tempdir;
+
+    /// mark_invalid downgrades a not-yet-validated (HeaderValid) block.
+    #[test]
+    fn test_mark_invalid_marks_header_valid_block() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.store_with_valid_metadata(&share);
+        assert_eq!(
+            store
+                .get_block_metadata(&share.block_hash())
+                .unwrap()
+                .status,
+            Status::HeaderValid
+        );
+
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_invalid(&share.block_hash(), None, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            store
+                .get_block_metadata(&share.block_hash())
+                .unwrap()
+                .status,
+            Status::Invalid
+        );
+    }
+
+    /// mark_invalid must not downgrade a block on the confirmed chain on a
+    /// later (transient) failure. Chain membership, not status, is the guard.
+    #[test]
+    fn test_mark_invalid_is_noop_for_confirmed() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.store_with_valid_metadata(&share);
+        let mut metadata = store.get_block_metadata(&share.block_hash()).unwrap();
+        metadata.status = Status::BlockValid;
+        metadata.chain = ChainMembership::Confirmed;
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_metadata(&share.block_hash(), &metadata, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_invalid(&share.block_hash(), None, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            store
+                .get_block_metadata(&share.block_hash())
+                .unwrap()
+                .status,
+            Status::BlockValid,
+            "mark_invalid must be a no-op for a confirmed block"
+        );
+    }
+
+    /// mark_invalid takes effect on a non-confirmed block even if it was
+    /// previously BlockValid: validation state is tracked independently of
+    /// chain membership, so a candidate that later fails re-validation can be
+    /// quarantined instead of being silently confirmed.
+    #[test]
+    fn test_mark_invalid_takes_effect_for_off_chain_block() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        // An off-chain (chain=None), previously-BlockValid block is still
+        // quarantined by mark_invalid. (The candidate-chain case is covered by
+        // the invalidation-reorg tests.)
+        let share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.store_with_valid_metadata(&share);
+        let mut metadata = store.get_block_metadata(&share.block_hash()).unwrap();
+        metadata.status = Status::BlockValid;
+        metadata.chain = ChainMembership::None;
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_metadata(&share.block_hash(), &metadata, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_invalid(&share.block_hash(), None, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            store
+                .get_block_metadata(&share.block_hash())
+                .unwrap()
+                .status,
+            Status::Invalid
+        );
+    }
+
+    /// mark_block_valid upgrades HeaderValid to BlockValid.
+    #[test]
+    fn test_mark_block_valid_upgrades_header_valid() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.store_with_valid_metadata(&share);
+
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&share.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            store
+                .get_block_metadata(&share.block_hash())
+                .unwrap()
+                .status,
+            Status::BlockValid
+        );
+    }
+
+    /// mark_block_valid is an idempotent no-op for an already-BlockValid
+    /// block (the re-validation cascade may re-check a valid descendant).
+    #[test]
+    fn test_mark_block_valid_is_noop_for_block_valid() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+        let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+        let mut batch = Store::get_write_batch();
+        store.setup_genesis(&genesis, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share = TestShareBlockBuilder::new()
+            .prev_share_blockhash(genesis.block_hash().to_string())
+            .nonce(0xe9695792)
+            .build();
+        store.store_with_valid_metadata(&share);
+        let mut metadata = store.get_block_metadata(&share.block_hash()).unwrap();
+        metadata.status = Status::BlockValid;
+        let mut batch = Store::get_write_batch();
+        store
+            .update_block_metadata(&share.block_hash(), &metadata, &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let mut batch = Store::get_write_batch();
+        store
+            .mark_block_valid(&share.block_hash(), &mut batch)
+            .unwrap();
+        store.commit_batch(batch).unwrap();
+
+        assert_eq!(
+            store
+                .get_block_metadata(&share.block_hash())
+                .unwrap()
+                .status,
+            Status::BlockValid
+        );
+    }
+
+    /// mark_block_valid is a precondition violation for a Pending or Invalid
+    /// block -- block validation must run on a header-validated,
+    /// not-yet-rejected block -- so it returns InvalidState rather than
+    /// silently succeeding.
+    #[test]
+    fn test_mark_block_valid_errors_for_pending_or_invalid() {
+        for status in [Status::Pending, Status::Invalid] {
+            let temp_dir = tempdir().unwrap();
+            let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+            let genesis = TestShareBlockBuilder::new().nonce(0xe9695791).build();
+            let mut batch = Store::get_write_batch();
+            store.setup_genesis(&genesis, &mut batch).unwrap();
+            store.commit_batch(batch).unwrap();
+
+            let share = TestShareBlockBuilder::new()
+                .prev_share_blockhash(genesis.block_hash().to_string())
+                .nonce(0xe9695792)
+                .build();
+            store.store_with_valid_metadata(&share);
+            let mut metadata = store.get_block_metadata(&share.block_hash()).unwrap();
+            metadata.status = status;
+            let mut batch = Store::get_write_batch();
+            store
+                .update_block_metadata(&share.block_hash(), &metadata, &mut batch)
+                .unwrap();
+            store.commit_batch(batch).unwrap();
+
+            let mut batch = Store::get_write_batch();
+            let result = store.mark_block_valid(&share.block_hash(), &mut batch);
+            assert!(
+                matches!(result, Err(StoreError::InvalidStatusTransition(_))),
+                "mark_block_valid must error for {status:?}, got {result:?}"
+            );
+
+            // The status must be left unchanged.
+            assert_eq!(
+                store
+                    .get_block_metadata(&share.block_hash())
+                    .unwrap()
+                    .status,
+                status,
+                "mark_block_valid must not change status for {status:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_setup_genesis() {
@@ -607,20 +1015,14 @@ mod tests {
             .prev_share_blockhash(genesis_block.block_hash().to_string())
             .nonce(0xe9695792)
             .build();
-
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&share1);
 
         // Create uncle (also child of genesis)
         let uncle1 = TestShareBlockBuilder::new()
             .prev_share_blockhash(genesis_block.block_hash().to_string())
             .nonce(0xe9695793) // Different nonce to get different hash
             .build();
-
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&uncle1, &mut batch).unwrap();
-        store.commit_batch(batch).unwrap();
+        store.store_with_valid_metadata(&uncle1);
 
         // Create share2 referencing uncle1
         let share2 = TestShareBlockBuilder::new()
@@ -628,11 +1030,10 @@ mod tests {
             .uncles(vec![uncle1.block_hash()])
             .nonce(0xe9695794)
             .build();
-
-        let mut batch = Store::get_write_batch();
-        store.add_share_block(&share2, &mut batch).unwrap();
+        store.store_with_valid_metadata(&share2);
         // Uncle block index updates are handled by organise_header, not
-        // add_share_block. Manually register uncle->nephew entries here.
+        // store_with_valid_metadata. Manually register uncle->nephew entries here.
+        let mut batch = Store::get_write_batch();
         for uncle_blockhash in &share2.header.uncles {
             store
                 .update_block_index(uncle_blockhash, &share2.block_hash(), &mut batch)
@@ -791,12 +1192,14 @@ mod tests {
         let metadata_a = BlockMetadata {
             expected_height: Some(1),
             chain_work: Work::from_le_bytes([1u8; 32]),
-            status: Status::Candidate,
+            status: Status::HeaderValid,
+            chain: ChainMembership::Candidate,
         };
         let metadata_b = BlockMetadata {
             expected_height: Some(2),
             chain_work: Work::from_le_bytes([2u8; 32]),
-            status: Status::Confirmed,
+            status: Status::BlockValid,
+            chain: ChainMembership::Confirmed,
         };
 
         let mut batch = Store::get_write_batch();
@@ -808,7 +1211,7 @@ mod tests {
             .unwrap();
         store.commit_batch(batch).unwrap();
 
-        let results = store.get_block_metadata_batch(&[hash_a, hash_b]);
+        let results = store.get_block_metadata_batch(&[hash_a, hash_b]).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], (hash_a, metadata_a));
         assert_eq!(results[1], (hash_b, metadata_b));
@@ -827,6 +1230,7 @@ mod tests {
             expected_height: Some(5),
             chain_work: Work::from_le_bytes([3u8; 32]),
             status: Status::HeaderValid,
+            chain: ChainMembership::None,
         };
 
         let mut batch = Store::get_write_batch();
@@ -835,7 +1239,9 @@ mod tests {
             .unwrap();
         store.commit_batch(batch).unwrap();
 
-        let results = store.get_block_metadata_batch(&[missing_hash, stored_hash]);
+        let results = store
+            .get_block_metadata_batch(&[missing_hash, stored_hash])
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], (stored_hash, metadata));
     }
@@ -845,7 +1251,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
 
-        let results = store.get_block_metadata_batch(&[]);
+        let results = store.get_block_metadata_batch(&[]).unwrap();
         assert!(results.is_empty());
     }
 
@@ -895,6 +1301,37 @@ mod tests {
         assert_eq!(share.template_merkle_branches[0], branch_a);
         assert_eq!(share.template_merkle_branches[1], branch_b);
         assert_eq!(share.template_merkle_branches[2], branch_c);
+    }
+
+    /// The bitcoin coinbase is not in the header, so it is stored beside the
+    /// block and comes back with it.
+    #[test]
+    fn test_bitcoin_coinbase_round_trip() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        let block = TestShareBlockBuilder::new().build();
+        let blockhash = block.block_hash();
+        let mut batch = Store::get_write_batch();
+        store.add_share_block(&block, &mut batch).unwrap();
+        store.commit_batch(batch).unwrap();
+
+        let share = store.get_share(&blockhash).unwrap();
+        assert_eq!(share.bitcoin_coinbase, block.bitcoin_coinbase);
+        assert_eq!(share, block);
+    }
+
+    #[test]
+    fn test_get_bitcoin_coinbase_returns_none_for_missing() {
+        let temp_dir = tempdir().unwrap();
+        let store = Store::new(temp_dir.path().to_str().unwrap().to_string(), false).unwrap();
+
+        assert!(
+            store
+                .get_bitcoin_coinbase(&BlockHash::all_zeros())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,22 +1,9 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::accounting::stats::pool_local_stats::load_pool_local_stats;
 use crate::accounting::stats::user::User;
-use crate::accounting::stats::worker::Worker;
 use crate::accounting::{payout::simple_pplns::SimplePplnsShare, stats::pool_local_stats};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,7 +14,6 @@ use tracing::error;
 const METRICS_MESSAGE_BUFFER_SIZE: usize = 1000;
 pub const INITIAL_USER_MAP_CAPACITY: usize = 1000;
 const METRICS_SAVE_INTERVAL: u64 = 5;
-
 /// Represents the metrics for the P2Poolv2 pool, we derive the stats every five minutes from this
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoolMetrics {
@@ -49,6 +35,13 @@ pub struct PoolMetrics {
     pub users: HashMap<String, User>,
     /// Current pool difficulty
     pub pool_difficulty: u64,
+    /// Confirmed sharechain pool difficulty since the last bitcoin block was
+    /// found; reset to zero on each block find. Numerator of the block effort
+    /// metric (`work_since_last_block / network_difficulty`). Runtime-only (not
+    /// persisted), mainnet-relative units matching network_difficulty. Pool
+    /// hashrate is derived separately from confirmed-chain total work.
+    #[serde(default)]
+    pub work_since_last_block: f64,
 }
 
 impl Default for PoolMetrics {
@@ -66,6 +59,7 @@ impl Default for PoolMetrics {
             best_share_ever: 0,
             users: HashMap::with_capacity(INITIAL_USER_MAP_CAPACITY),
             pool_difficulty: 0,
+            work_since_last_block: 0.0,
         }
     }
 }
@@ -95,6 +89,13 @@ pub enum MetricsMessage {
         response: oneshot::Sender<()>,
     },
     RecordShareRejected {
+        response: oneshot::Sender<()>,
+    },
+    ResetBlockEffort {
+        response: oneshot::Sender<()>,
+    },
+    RecordConfirmedShare {
+        difficulty: f64,
         response: oneshot::Sender<()>,
     },
     IncrementWorkerCount {
@@ -166,6 +167,17 @@ impl MetricsActor {
                 self.record_share_rejected();
                 let _ = response.send(());
             }
+            MetricsMessage::ResetBlockEffort { response } => {
+                self.reset_block_effort();
+                let _ = response.send(());
+            }
+            MetricsMessage::RecordConfirmedShare {
+                difficulty,
+                response,
+            } => {
+                self.record_confirmed_share(difficulty);
+                let _ = response.send(());
+            }
             MetricsMessage::IncrementWorkerCount {
                 btcaddress,
                 workername,
@@ -226,6 +238,21 @@ impl MetricsActor {
         self.metrics.rejected_total += 1;
     }
 
+    /// Reset the block effort accumulator after the pool finds a bitcoin
+    /// block, so work counts toward the next block.
+    ///
+    /// The found block itself is recorded in the store, not here.
+    fn reset_block_effort(&mut self) {
+        self.metrics.work_since_last_block = 0.0;
+    }
+
+    /// Record the pool difficulty of a confirmed sharechain share for the
+    /// per-block effort accumulator. Hashrate is derived separately from
+    /// confirmed-chain total work.
+    fn record_confirmed_share(&mut self, difficulty: f64) {
+        self.metrics.work_since_last_block += difficulty;
+    }
+
     /// Increment worker counts - called after worker has authorised successfully.
     /// Uses entry().or_default() to preserve existing worker stats on reconnect.
     fn worker_authorized(&mut self, btcaddress: String, workername: String) {
@@ -244,12 +271,11 @@ impl MetricsActor {
     /// Decrement pool wide worker counts, if worker found as authorised. Unauthorised workers are not counted.
     /// Also marks Worker inactive, if found.
     fn mark_worker_inactive(&mut self, btcaddress: Option<String>, workername: String) {
-        if let Some(btcaddress) = btcaddress {
-            if let Some(user) = self.metrics.users.get_mut(&btcaddress) {
-                if let Some(worker) = user.workers.get_mut(&workername) {
-                    worker.active = false;
-                }
-            }
+        if let Some(btcaddress) = btcaddress
+            && let Some(user) = self.metrics.users.get_mut(&btcaddress)
+            && let Some(worker) = user.workers.get_mut(&workername)
+        {
+            worker.active = false;
         }
     }
 
@@ -263,9 +289,9 @@ impl MetricsActor {
     /// Set last update time. Largely used for testing.
     fn set_last_update(&mut self, lastupdate: u64) {
         self.metrics.lastupdate = Some(lastupdate);
-        for (_btcaddress, user) in self.metrics.users.iter_mut() {
+        for user in self.metrics.users.values_mut() {
             user.last_share_at = lastupdate;
-            for (_workername, worker) in user.workers.iter_mut() {
+            for worker in user.workers.values_mut() {
                 worker.last_share_at = lastupdate;
             }
         }
@@ -311,6 +337,36 @@ impl MetricsHandle {
             })
             .await
             .expect("Error recording share");
+        response_rx.await
+    }
+
+    /// Reset the block effort accumulator after the pool finds a bitcoin
+    /// block.
+    pub async fn reset_block_effort(&self) -> Result<(), tokio::sync::oneshot::error::RecvError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(MetricsMessage::ResetBlockEffort {
+                response: response_tx,
+            })
+            .await
+            .expect("Error resetting block effort");
+        response_rx.await
+    }
+
+    /// Record the pool difficulty of a confirmed sharechain share for the
+    /// block effort metric.
+    pub async fn record_confirmed_share(
+        &self,
+        difficulty: f64,
+    ) -> Result<(), tokio::sync::oneshot::error::RecvError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(MetricsMessage::RecordConfirmedShare {
+                difficulty,
+                response: response_tx,
+            })
+            .await
+            .expect("Error recording confirmed share");
         response_rx.await
     }
 
@@ -389,6 +445,19 @@ impl MetricsHandle {
             .expect("Error setting last update");
         response_rx.await
     }
+}
+
+/// Spawn a metrics actor with default metrics and return its handle.
+///
+/// Test-only helper for wiring components that require a `MetricsHandle`
+/// without touching disk or the stats saver.
+#[cfg(test)]
+pub(crate) fn spawn_test_metrics_handle() -> MetricsHandle {
+    let (sender, receiver) = mpsc::channel(METRICS_MESSAGE_BUFFER_SIZE);
+    tokio::spawn(async move {
+        MetricsActor::new(receiver).run().await;
+    });
+    MetricsHandle { sender }
 }
 
 /// Construct a new metrics actor with existing metrics and return its handle
@@ -500,6 +569,27 @@ mod tests {
         let _ = handle.record_share_rejected().await;
 
         let _ = handle.record_share_rejected().await;
+    }
+
+    #[tokio::test]
+    async fn test_confirmed_share_and_block_effort_reset() {
+        let log_dir = tempfile::tempdir().unwrap();
+        let handle = start_metrics(log_dir.path().to_str().unwrap().to_string())
+            .await
+            .unwrap();
+
+        // Confirmed sharechain work accumulates into the effort numerator.
+        let _ = handle.record_confirmed_share(500.0).await;
+        let _ = handle.record_confirmed_share(250.0).await;
+
+        let metrics = handle.get_metrics().await;
+        assert_eq!(metrics.work_since_last_block, 750.0);
+
+        let _ = handle.reset_block_effort().await;
+
+        let metrics = handle.get_metrics().await;
+        // Finding a block resets effort toward the next block.
+        assert_eq!(metrics.work_since_last_block, 0.0);
     }
 
     #[tokio::test]

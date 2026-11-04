@@ -1,0 +1,6 @@
+# GitHub Linguist: .rs is ambiguous between Rust and RenderScript.
+*.rs linguist-language=Rust
+
+# Genesis bitcoin blocks as raw consensus bytes, pulled in via include_bytes!.
+# Binary: no textual diffs, so magit and editors never render them.
+p2poolv2_lib/src/shares/genesis/*.dat binary

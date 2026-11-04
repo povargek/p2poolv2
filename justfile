@@ -1,4 +1,4 @@
-set unstable := true
+set unstable
 
 dev_config := "." / "config-dev.toml"
 default_config := "." / "config.toml"
@@ -24,9 +24,15 @@ _default:
     echo 'Edit the ./config-dev.toml file for your specific needs'
     echo 'You can easily run a local cluster with `just compose`'
 
-# Run tests for entire workspace or a specific package
+# Run tests for entire workspace or a specific package.
+# The full-workspace run (no package arg) adds a second pass that runs the
+# whole p2poolv2_lib suite with the `sim` feature enabled. p2poolv2_lib is the
+# only crate with sim-conditional code, so this covers every sim-gated test
+# without a fragile name filter. The lib already recompiles under `--features
+# sim` regardless, so the extra cost is only re-executing the unit tests.
 test package="":
     cargo nextest run {{ if package == "" { "" } else { "-p " + package } }}
+    {{ if package == "" { "cargo nextest run -p p2poolv2_lib --features sim" } else { "true" } }}
 
 # Run a specific test in a package with debug logging and no output capture
 debug-test package="p2poolv2_tests" testname="":
@@ -55,7 +61,7 @@ build package="":
 
 # Build a release version of all packages and binaries in the workspace
 build-release:
-    RUSTFLAGS='-C target-cpu=native' cargo build --workspace --release
+    cargo build --workspace --release
 
 run-release config=target_config:
     cargo run --release --package p2poolv2_node -- --config={{ config }}
@@ -74,14 +80,38 @@ perf config="config.toml":
 check:
     cargo check --workspace
 
+# Lint the entire workspace, matching what CI enforces
+clippy:
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# The full gate a change must pass before it is done
+preflight: clippy
+    cargo fmt --all -- --check
+    cargo fmt --manifest-path p2poolv2_lib/fuzz/Cargo.toml -- --check
+    just test
+
+# Check dependency licences, duplicate versions and source registries.
+# Matches the blocking CI job. Advisories are deliberately not included: CI runs
+# them non-blocking, so failing here would report a problem that does not gate
+# the merge. Run `just advisories` for those.
+deny:
+    cargo deny check licenses bans sources
+
+# Check dependencies against the RustSec advisory database. Informational: the
+# CI job for this is non-blocking, because a newly published advisory should not
+# stop an unrelated merge.
+advisories:
+    cargo deny check advisories
+
 # Run cli commands using p2poolv2-cli - e.g. just cli info
 cli *args:
     cargo run -p p2poolv2_node --bin p2poolv2_cli -- {{ args }}
 
-# Format source code
+# Format source code. The fuzz crate is its own workspace, so `--all` does
+# not reach it.
 fmt:
     cargo fmt --all
-    just --fmt --unstable
+    cargo fmt --manifest-path p2poolv2_lib/fuzz/Cargo.toml
 
 # Run benchmarks for a package and bench target
 bench package="p2poolv2_lib" name="pplns_window":
@@ -97,7 +127,7 @@ bench-flamegraph package="p2poolv2_lib" name="pplns_window" function="get_addres
 
 # Verify chain integrity in a store.db
 verify_chain db_path:
-    cargo run --bin verify_chain --features debug-tools -- {{ db_path }}
+    cargo run --release --bin verify_chain --features debug-tools -- {{ db_path }}
 
 # fix common warnings
 fix:
@@ -133,8 +163,8 @@ container-explore: (docker-run "--entrypoint bash")
 # Starts a service specified in docker container
 [group("docker")]
 [working-directory("docker")]
-compose *services="all":
-    P2POOL_CONFIG={{ target_config }} docker compose --env-file .env up -d --build --force-recreate {{ if services == "all" { "" } else { services } }}
+compose *services="":
+    P2POOL_CONFIG={{ target_config }} docker compose --env-file .env --profile developer up -d --build --force-recreate {{ services }}
 
 # Start a shell in a docker compose service
 [group("docker")]

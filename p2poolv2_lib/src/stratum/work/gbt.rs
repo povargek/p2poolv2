@@ -1,18 +1,6 @@
-// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+// SPDX-FileCopyrightText: 2024-2026 P2Poolv2 Developers (see AUTHORS)
 //
-// This file is part of P2Poolv2
-//
-// P2Poolv2 is free software: you can redistribute it and/or modify it under
-// the terms of the GNU General Public License as published by the Free
-// Software Foundation, either version 3 of the License, or (at your option)
-// any later version.
-//
-// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License along with
-// P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::stratum::work::block_template::BlockTemplate;
 use crate::stratum::work::error::WorkError;
@@ -20,7 +8,7 @@ use crate::stratum::work::notify::{NotifyCmd, NotifySender};
 use bitcoin::hashes::{Hash, sha256d};
 use bitcoindrpc::{BitcoinRpcConfig, BitcoindRpcClient};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, instrument};
 
 #[cfg(test)]
 const GBT_NO_TRANSACTIONS_FIXTURE: &str =
@@ -508,7 +496,7 @@ mod gbt_server_tests {
         )
         .await;
 
-        println!("Result: {:?}", result);
+        println!("Result: {result:?}");
 
         assert!(result.is_ok());
 
